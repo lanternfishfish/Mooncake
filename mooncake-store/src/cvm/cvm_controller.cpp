@@ -615,6 +615,7 @@ void CvmController::RefreshRingSlotsCache() {
         }
     }
     ring_slot_group_count_ = group_count;
+    ring_slots_revision_ = version;
     ring_slots_cache_ = std::move(next);
     // 与缓存同一临界区同步 revision（LoadAllRingSlotAssigns 的 range read
     // header ModRevision），保证 route_epoch 门控数据（cvm_ring_revision_）
@@ -711,7 +712,8 @@ RingSlotsView CvmController::BuildRingSlotsView() {
         snapshot.push_back(assign);  // map 按序遍历 = rank 升序
     }
     // assigns 与 G 同锁拷入快照，消费方不会观测到两者错配。
-    return RingSlotsView(std::move(snapshot), ring_slot_group_count_);
+    return RingSlotsView(std::move(snapshot), ring_slot_group_count_,
+                         ring_slots_revision_);
 }
 
 void CvmController::KeepaliveLoop() {

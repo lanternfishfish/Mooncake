@@ -3845,6 +3845,10 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
                 last_logged_owned_count_ = new_count;
             }
             cvm_last_resolved_owned_slots_ = owned;
+            // ★ ring_slots 视图的 etcd 版本：vsegment 的
+            // LoadEffectivePartitionRoute 要求 ring_revision > 0，
+            // 否则所有 Partition 都会被判成 INVALID_VERSION。
+            cvm_ring_revision_ = view.revision();
             return owned;
         }
         // 缓存有记录但本机非任何 rank 的 primary：本机 standby，返回空段。
@@ -3867,6 +3871,7 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
                 last_logged_owned_count_ = 0;
             }
             cvm_last_resolved_owned_slots_.clear();
+            cvm_ring_revision_ = view.revision();
         }
         return {};
     }
