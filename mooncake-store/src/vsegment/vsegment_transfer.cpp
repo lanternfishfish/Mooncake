@@ -1,12 +1,28 @@
 #include "vsegment/vsegment_transfer.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <limits>
+#include <string>
 #include <unordered_map>
 
 namespace mooncake::vsegment {
 
 namespace {
+
+// Shadow mode: always resolve through the legacy view cache + endpoint RPC,
+// but compare the result against the inline table. Used by the rollback drill
+// to prove the inline data matches the old path before switching reads.
+bool VSegmentLayoutShadowEnabled() {
+    // Re-read per call (not cached) so the rollback drill and unit tests can
+    // toggle it on a running process.
+    const char* env = std::getenv("MC_VSEGMENT_LAYOUT_SHADOW");
+    if (env == nullptr) return false;
+    const std::string value(env);
+    return !(value == "0" || value == "false" || value == "no" ||
+             value == "off");
+}
 
 std::string ViewCacheKey(const std::string& partition_id,
                          const std::string& vsegment_id) {
@@ -106,6 +122,7 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
         return plan;
     }
     VSegmentView view;
+    bool have_layout = false;
     bool use_layout = false;
     std::unordered_map<std::string, PSegmentLocation> layout_locations;
     if (layouts != nullptr) {
@@ -144,7 +161,8 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
                 ValidateViewStructure(candidate, &validation_detail) ==
                     ErrorCode::OK) {
                 view = std::move(candidate);
-                use_layout = true;
+                have_layout = true;
+                use_layout = !VSegmentLayoutShadowEnabled();
             } else {
                 layout_locations.clear();
             }
@@ -222,6 +240,30 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
         // NOTE: endpoint is shared by every sub-request of this segment, so it
         // must be copied rather than moved.
         plan.requests.push_back({std::move(request), location.endpoint});
+    }
+    if (have_layout && !use_layout) {
+        // Shadow comparison: layout entry vs legacy resolution for each
+        // distinct segment touched by this transfer.
+        static std::atomic<uint64_t> mismatches{0};
+        for (const auto& [segment_id, layout_location] : layout_locations) {
+            auto legacy = endpoints.find(segment_id);
+            if (legacy == endpoints.end()) continue;
+            if (legacy->second.endpoint == layout_location.endpoint &&
+                legacy->second.base_address ==
+                    layout_location.base_address) {
+                continue;
+            }
+            const uint64_t count = ++mismatches;
+            if (count <= 5 || count % 1000 == 0) {
+                LOG(WARNING) << "vsegment layout shadow mismatch"
+                             << " segment=" << segment_id
+                             << " legacy_endpoint=" << legacy->second.endpoint
+                             << " inline_endpoint=" << layout_location.endpoint
+                             << " legacy_base=" << legacy->second.base_address
+                             << " inline_base=" << layout_location.base_address
+                             << " total_mismatches=" << count;
+            }
+        }
     }
     return plan;
 }

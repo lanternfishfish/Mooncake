@@ -17,6 +17,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <limits>
 #include <map>
@@ -881,6 +882,32 @@ TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutMemberHasNoEndpoint) {
     EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
     EXPECT_EQ(provider.loads, 1);
     EXPECT_EQ(endpoints.resolves, 2);
+}
+
+TEST(VSegmentTransferPlannerTest, ShadowModeStillResolvesLegacyPath) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    std::vector<VSegmentLayoutEntry> layouts{
+        MakeLayoutEntryFromView(allocation.view, 0x200000)};
+
+    ASSERT_EQ(setenv("MC_VSEGMENT_LAYOUT_SHADOW", "1", 1), 0);
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    unsetenv("MC_VSEGMENT_LAYOUT_SHADOW");
+
+    ASSERT_TRUE(plan) << plan.detail;
+    // Shadow mode must not consume the inline table: the legacy view load and
+    // endpoint RPCs still happen, and the plan uses the legacy endpoints.
+    EXPECT_EQ(provider.loads, 1);
+    EXPECT_EQ(endpoints.resolves, 2);
+    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
+    EXPECT_EQ(plan.requests[0].transfer.physical_offset, 4096 + 48);
 }
 
 TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutHasNoMatchingVSegment) {
