@@ -273,8 +273,6 @@ class CvmController {
     //（成员死亡晋升的修正流未完成时）。
     std::mutex ring_slots_mutex_;
     uint32_t ring_slot_group_count_{0};
-    // ring_slots 缓存最近一次成功加载的 etcd revision（0 = 从未加载）。
-    uint64_t ring_slots_revision_{0};
     std::map<uint32_t, RingSlotAssign> ring_slots_cache_;
     // 最近一次缓存刷新读取 ring_slots 前缀时的 etcd revision（range read
     // header ModRevision，随任何 etcd 写——含归属 CAS——单调递增）。供
