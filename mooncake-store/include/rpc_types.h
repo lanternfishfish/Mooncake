@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <ylt/struct_pack/compatible.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -149,15 +150,16 @@ YLT_REFL(GetReplicaListByRegexResponse, results, vsegment_layouts);
 inline void MergeVSegmentLayoutTable(
     std::vector<VSegmentLayoutEntry>& target,
     const std::vector<VSegmentLayoutEntry>& incoming) {
+    if (incoming.empty()) return;
+    // Hash-based dedup: a 30k-key batch can carry thousands of entries, and the
+    // merge runs once per route group.
+    std::unordered_set<std::string> seen;
+    seen.reserve(target.size() + incoming.size());
+    for (const auto& entry : target) seen.insert(entry.vsegment_id);
     for (const auto& entry : incoming) {
-        bool exists = false;
-        for (const auto& existing : target) {
-            if (existing.vsegment_id == entry.vsegment_id) {
-                exists = true;
-                break;
-            }
+        if (seen.insert(entry.vsegment_id).second) {
+            target.push_back(entry);
         }
-        if (!exists) target.push_back(entry);
     }
 }
 
