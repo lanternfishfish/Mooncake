@@ -122,6 +122,7 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
         return plan;
     }
     VSegmentView view;
+    VSegmentView candidate;
     bool have_layout = false;
     bool use_layout = false;
     std::unordered_map<std::string, PSegmentLocation> layout_locations;
@@ -133,7 +134,6 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
             });
         if (it != layouts->end() &&
             it->partition_id == replica.partition_id) {
-            VSegmentView candidate;
             candidate.vsegment_id = it->vsegment_id;
             candidate.partition_id = it->partition_id;
             candidate.mapping_algorithm =
@@ -242,8 +242,16 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
         plan.requests.push_back({std::move(request), location.endpoint});
     }
     if (have_layout && !use_layout) {
-        // Shadow comparison: layout entry vs legacy resolution for each
-        // distinct segment touched by this transfer.
+        // Shadow comparison: layout entry vs legacy resolution.
+        static std::atomic<uint64_t> view_mismatches{0};
+        if (!SameImmutableView(candidate, view)) {
+            const uint64_t count = ++view_mismatches;
+            if (count <= 5 || count % 1000 == 0) {
+                LOG(WARNING) << "vsegment layout shadow view mismatch"
+                             << " vsegment=" << replica.vsegment_id
+                             << " total_mismatches=" << count;
+            }
+        }
         static std::atomic<uint64_t> mismatches{0};
         for (const auto& [segment_id, layout_location] : layout_locations) {
             auto legacy = endpoints.find(segment_id);
