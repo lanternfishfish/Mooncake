@@ -7581,8 +7581,6 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
 
 BatchGetReplicaListResponse MasterService::BatchGetReplicaListWithLayouts(
     const std::vector<std::string>& keys, const TenantId& tenant_id) {
-    using GetResult = tl::expected<GetReplicaListResponse, ErrorCode>;
-
     assert(tenant_id.IsValid());
 
     BatchGetReplicaListResponse response;
