@@ -399,9 +399,11 @@ using mooncake::SelectBestReplica;
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
-    return QueryResult(
+    QueryResult filtered(
         {replica}, qr.lease_timeout,
         include_object_checksum ? qr.object_checksum : std::nullopt);
+    filtered.vsegment_layouts = qr.vsegment_layouts;
+    return filtered;
 }
 }  // namespace
 

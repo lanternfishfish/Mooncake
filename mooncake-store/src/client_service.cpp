@@ -1454,6 +1454,15 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
+namespace {
+std::shared_ptr<const std::vector<VSegmentLayoutEntry>> MakeVSegmentLayouts(
+    const GetReplicaListResponse& response) {
+    if (!response.vsegment_layouts.has_value()) return nullptr;
+    return std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+        *response.vsegment_layouts);
+}
+}  // namespace
+
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
     std::chrono::steady_clock::time_point start_time =
@@ -1475,10 +1484,12 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
-    return QueryResult(
+    QueryResult query(
         std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
         result.value().object_checksum);
+    query.vsegment_layouts = MakeVSegmentLayouts(result.value());
+    return query;
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1539,11 +1550,13 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
-            results.emplace_back(QueryResult(
+            QueryResult query(
                 std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum));
+                response[i].value().object_checksum);
+            query.vsegment_layouts = MakeVSegmentLayouts(response[i].value());
+            results.emplace_back(std::move(query));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -1678,7 +1691,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    err = TransferRead(replica, slices, query_result.vsegment_layouts.get());
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
@@ -1759,7 +1772,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferReadRange(replica, slices, src_offset);
+    err = TransferReadRange(replica, slices, src_offset,
+                            query_result.vsegment_layouts.get());
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -2323,6 +2337,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     // vsegment 副本 Descriptor 仅含逻辑位置，其物理端点经 TransferWrite
     // 内部解析传输 plan 后回填到 failed_endpoints（条带成员级归因）。
     std::set<std::string> failed_endpoints;
+    const auto* put_layouts = put_start.vsegment_layouts.has_value()
+                                  ? &*put_start.vsegment_layouts
+                                  : nullptr;
     for (const auto& replica : put_start.replicas) {
         if (replica.is_memory_replica() || replica.is_nof_replica() ||
             replica.is_vsegment_replica()) {
@@ -2332,8 +2349,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                       : replica.is_vsegment_replica()
                                           ? ReplicaType::MEMORY
                                           : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err =
-                TransferWrite(replica, slices, &failed_endpoints);
+            ErrorCode transfer_err = TransferWrite(
+                replica, slices, &failed_endpoints, put_layouts);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
                 if (replica.is_memory_replica()) {
@@ -2464,11 +2481,14 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     // 仅含逻辑位置，其物理端点经 TransferWrite 内部解析传输 plan 后回填
     // 到 failed_endpoints（条带成员级归因）。
     std::set<std::string> failed_endpoints;
+    const auto* upsert_layouts = upsert_start.vsegment_layouts.has_value()
+                                     ? &*upsert_start.vsegment_layouts
+                                     : nullptr;
     // Transfer to memory-class replicas (direct memory or vsegment).
     for (const auto& replica : upsert_start.replicas) {
         if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
-            ErrorCode transfer_err =
-                TransferWrite(replica, slices, &failed_endpoints);
+            ErrorCode transfer_err = TransferWrite(
+                replica, slices, &failed_endpoints, upsert_layouts);
             if (transfer_err != ErrorCode::OK) {
                 if (replica.is_memory_replica()) {
                     failed_endpoints.insert(replica.get_memory_descriptor()
@@ -5009,10 +5029,11 @@ void Client::PutToLocalFile(const std::string& key,
     });
 }
 
-ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code,
-                               std::set<std::string>* failed_endpoints) {
+ErrorCode Client::TransferData(
+    const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+    std::set<std::string>* failed_endpoints,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     // TransferData 读写共函数：仅读路径（op_code==READ）计入 GET_SINGLE_
     // TRANSFER_* 键，写路径 PUT_* 键待后续批次，避免读写流量互相污染。
     // SUBMIT/WAIT 拆分用于区分 RDMA 提交阻塞与传输等待。
@@ -5048,7 +5069,8 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                 {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
         }
         auto plan = vsegment_transfer_planner_->Plan(
-            replica_descriptor.get_vsegment_descriptor(), client_slices);
+            replica_descriptor.get_vsegment_descriptor(), client_slices,
+            layouts);
         if (!plan) {
             LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
             if (is_read) pt_full.End(-1);
@@ -5108,7 +5130,8 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::TransferReadInternal(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
@@ -5134,7 +5157,8 @@ ErrorCode Client::TransferReadInternal(
             return ErrorCode::INVALID_PARAMS;
         replica.logical_offset += src_offset;
         replica.length = length;
-        auto plan = vsegment_transfer_planner_->Plan(replica, client_slices);
+        auto plan =
+            vsegment_transfer_planner_->Plan(replica, client_slices, layouts);
         if (!plan) return plan.error;
         auto future = transfer_submitter_->submitVSegment(
             plan, TransferRequest::READ);
@@ -5153,15 +5177,18 @@ ErrorCode Client::TransferReadInternal(
     return future->get();
 }
 
-ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices,
-                                std::set<std::string>* failed_endpoints) {
+ErrorCode Client::TransferWrite(
+    const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices, std::set<std::string>* failed_endpoints,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE,
-                        failed_endpoints);
+                        failed_endpoints, layouts);
 }
 
-ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices) {
+ErrorCode Client::TransferRead(
+    const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     // 读传输整窗（size 校验 + TransferData 读分支）；内部 GET_SINGLE_
     // TRANSFER_FULL 为其子窗，差值即校验开销
     SpDiag::PerfPoint pt_read(PerfKey::GET_SINGLE_TRANSFER_READ,
@@ -5192,16 +5219,17 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    const ErrorCode read_result =
-        TransferData(replica_descriptor, slices, TransferRequest::READ);
+    const ErrorCode read_result = TransferData(
+        replica_descriptor, slices, TransferRequest::READ, nullptr, layouts);
     pt_read.End(read_result == ErrorCode::OK ? 0 : -1);
     return read_result;
 }
 
 ErrorCode Client::TransferReadRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t src_offset) {
-    return TransferReadInternal(replica_descriptor, slices, src_offset);
+    uint64_t src_offset, const std::vector<VSegmentLayoutEntry>* layouts) {
+    return TransferReadInternal(replica_descriptor, slices, src_offset,
+                                layouts);
 }
 
 void Client::PollAndDispatchTasks() {

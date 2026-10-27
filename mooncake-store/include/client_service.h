@@ -46,6 +46,11 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /**
+     * @brief Optional runtime layout table carried by the RPC response.
+     * Only populated for vsegment replicas; shared across a batch.
+     */
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> vsegment_layouts;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param,
@@ -849,25 +854,32 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
-    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code,
-                           std::set<std::string>* failed_endpoints = nullptr);
+    ErrorCode TransferData(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t src_offset);
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     // failed_endpoints：vsegment 传输失败归因用。vsegment 副本 Descriptor 仅含
     // 逻辑位置，物理端点在传输 plan 中解析；失败时 best-effort 上报 plan 中
     // 全部条带成员端点（无法定位具体失败成员，误报由 worker 重挂载时
     // MountSegment 的 erase 自愈兜底）。非 vsegment 副本不填充。
-    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices,
-                            std::set<std::string>* failed_endpoints = nullptr);
-    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
-    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices,
-                                uint64_t src_offset);
+    ErrorCode TransferWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
+    ErrorCode TransferRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
+    ErrorCode TransferReadRange(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);

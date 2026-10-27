@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "replica.h"
+#include "rpc_types.h"
 #include "vsegment/vsegment_runtime.h"
 
 namespace mooncake::vsegment {
@@ -76,6 +77,13 @@ class VSegmentTransferPlanner {
 
     VSegmentTransferPlan Plan(const VSegmentDescriptor& replica,
                               const std::vector<ClientSlice>& slices);
+    // Uses the runtime-resolved layout table carried by the RPC response when
+    // it contains this vsegment; falls back to the view cache + endpoint
+    // resolver otherwise.
+    VSegmentTransferPlan Plan(
+        const VSegmentDescriptor& replica,
+        const std::vector<ClientSlice>& slices,
+        const std::vector<VSegmentLayoutEntry>* layouts);
 
    private:
     VSegmentViewProvider* provider_;
