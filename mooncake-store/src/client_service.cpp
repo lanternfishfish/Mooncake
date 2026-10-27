@@ -1447,11 +1447,11 @@ Client::BatchQueryIp(const std::vector<UUID>& client_ids) {
     return result;
 }
 
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-             ErrorCode>
-Client::QueryByRegex(const std::string& str) {
-    auto result = master_client_.GetReplicaListByRegex(str);
-    return result;
+tl::expected<GetReplicaListByRegexResponse, ErrorCode> Client::QueryByRegex(
+    const std::string& str) {
+    // 完整版 C：返回 envelope（map + 去重 layout 表）。当前无 in-tree
+    // 调用方，表原样透传即可。
+    return master_client_.GetReplicaListByRegex(str);
 }
 
 namespace {

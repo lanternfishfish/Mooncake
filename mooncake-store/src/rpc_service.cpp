@@ -274,14 +274,13 @@ WrappedMasterService::BatchReplicaClear(
     return result;
 }
 
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-             ErrorCode>
+tl::expected<GetReplicaListByRegexResponse, ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str,
                                             const std::string& tenant_id) {
-    return execute_rpc(
+    auto response = execute_rpc(
         "GetReplicaListByRegex",
-        [&] {
-            return WithRequestTenant(
+        [&]() -> tl::expected<GetReplicaListByRegexResponse, ErrorCode> {
+            auto matched = WithRequestTenant(
                 master_service_.IsTenantQuotaEnabled()
                     ? std::string_view(tenant_id)
                     : TenantId::kDefaultValue,
@@ -289,6 +288,29 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
                     return master_service_.GetReplicaListByRegex(
                         str, resolved_tenant_id);
                 });
+            if (!matched) {
+                return tl::make_unexpected(matched.error());
+            }
+            GetReplicaListByRegexResponse envelope;
+            std::vector<std::pair<std::string, std::string>> vsegments;
+            for (const auto& matched_item : *matched) {
+                for (const auto& replica : matched_item.second) {
+                    if (!replica.is_vsegment_replica()) continue;
+                    const auto& descriptor =
+                        replica.get_vsegment_descriptor();
+                    vsegments.emplace_back(descriptor.partition_id,
+                                           descriptor.vsegment_id);
+                }
+            }
+            envelope.results = std::move(*matched);
+            if (!vsegments.empty()) {
+                auto layouts =
+                    master_service_.BuildVSegmentLayoutTable(vsegments);
+                if (!layouts.empty()) {
+                    envelope.vsegment_layouts = std::move(layouts);
+                }
+            }
+            return envelope;
         },
         [&](auto& timer) { timer.LogRequest("Regex=", str); },
         [] {

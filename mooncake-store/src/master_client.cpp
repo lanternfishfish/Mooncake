@@ -1283,16 +1283,14 @@ MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
     return result;
 }
 
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-             ErrorCode>
+tl::expected<GetReplicaListByRegexResponse, ErrorCode>
 MasterClient::GetReplicaListByRegex(const std::string& str) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaListByRegex");
     timer.LogRequest("Regex=", str);
 
     auto result = invoke_rpc<
         &WrappedMasterService::GetReplicaListByRegex,
-        std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(
-        str, tenant_id_.value());
+        GetReplicaListByRegexResponse>(str, tenant_id_.value());
 
     timer.LogResponseExpected(result);
     return result;

@@ -155,10 +155,8 @@ class Client {
      * @return An expected object containing a map from object keys to their
      * replica descriptors on success, or an ErrorCode on failure.
      */
-    tl::expected<
-        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-        ErrorCode>
-    QueryByRegex(const std::string& str);
+    tl::expected<GetReplicaListByRegexResponse, ErrorCode> QueryByRegex(
+        const std::string& str);
 
     /**
      * @brief Returns unique offload RPC endpoints currently known by master.

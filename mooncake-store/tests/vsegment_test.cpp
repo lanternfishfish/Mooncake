@@ -274,6 +274,28 @@ TEST(VSegmentLayoutWireTest, BatchUpsertEnvelopeRoundTripKeepsDedupTable) {
     EXPECT_EQ(decoded.vsegment_layouts->front().vsegment_id, "vs-1");
 }
 
+TEST(VSegmentLayoutWireTest, RegexEnvelopeBothDirections) {
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>> legacy;
+    legacy.emplace("key-1", std::vector<Replica::Descriptor>{});
+    const auto legacy_bytes = struct_pack::serialize(legacy);
+
+    GetReplicaListByRegexResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, legacy_bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.results.size(), 1u);
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+
+    decoded.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(decoded);
+
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+        legacy_reader;
+    ASSERT_EQ(struct_pack::deserialize_to(legacy_reader, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(legacy_reader.size(), 1u);
+}
+
 TEST(VSegmentLayoutWireTest, MergeVSegmentLayoutTableDeduplicates) {
     std::vector<VSegmentLayoutEntry> target;
     auto first = MakeTestLayoutEntry();

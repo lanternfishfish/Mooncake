@@ -60,9 +60,7 @@ class WrappedMasterService {
         const std::vector<std::string>& object_keys, const UUID& client_id,
         const std::string& segment_name);
 
-    tl::expected<
-        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-        ErrorCode>
+    tl::expected<GetReplicaListByRegexResponse, ErrorCode>
     GetReplicaListByRegex(const std::string& str,
                           const std::string& tenant_id = "default");
 

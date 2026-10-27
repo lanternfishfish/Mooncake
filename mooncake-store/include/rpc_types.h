@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <unordered_map>
 
 #include <ylt/struct_pack/compatible.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -132,6 +133,15 @@ struct BatchUpsertStartResponse {
         vsegment_layouts;
 };
 YLT_REFL(BatchUpsertStartResponse, results, vsegment_layouts);
+
+// Regex lookup returns descriptors per matched key; the envelope adds the
+// deduplicated layout table for the vsegment replicas in those lists.
+struct GetReplicaListByRegexResponse {
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>> results;
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
+};
+YLT_REFL(GetReplicaListByRegexResponse, results, vsegment_layouts);
 
 // Appends `incoming` to `target`, keeping the first entry per vsegment_id.
 // Used to merge tables built by different masters (route groups) into the

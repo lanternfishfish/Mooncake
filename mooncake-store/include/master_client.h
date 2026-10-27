@@ -281,9 +281,7 @@ class MasterClient {
      * @return An expected object containing a map from object keys to their
      * replica descriptors on success, or an ErrorCode on failure.
      */
-    [[nodiscard]] tl::expected<
-        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-        ErrorCode>
+    [[nodiscard]] tl::expected<GetReplicaListByRegexResponse, ErrorCode>
     GetReplicaListByRegex(const std::string& str);
 
     /**
