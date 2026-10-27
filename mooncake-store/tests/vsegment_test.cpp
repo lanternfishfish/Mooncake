@@ -9,6 +9,7 @@
 #include "vsegment/vsegment_metrics.h"
 #include "vsegment/partition_quota_planner.h"
 #include "master_service.h"
+#include "rpc_types.h"
 
 #include <gtest/gtest.h>
 
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <future>
 #include <limits>
+#include <map>
 #include <thread>
 
 namespace mooncake::vsegment {
@@ -98,6 +100,104 @@ TEST(VSegmentSnapshotCompatibilityTest, ReadsLegacyCompletedOperation) {
     ASSERT_EQ(decoded.completed_operations.size(), 1u);
     EXPECT_EQ(decoded.completed_operations[0].completion_revision.value_or(0),
               0u);
+}
+
+struct LegacyGetReplicaListResponse {
+    std::vector<Replica::Descriptor> replicas;
+    uint64_t lease_ttl_ms{0};
+    std::optional<uint64_t> object_checksum;
+};
+YLT_REFL(LegacyGetReplicaListResponse, replicas, lease_ttl_ms,
+         object_checksum);
+
+struct LegacyPutStartResult {
+    std::string operation_id;
+    std::vector<Replica::Descriptor> replicas;
+};
+YLT_REFL(LegacyPutStartResult, operation_id, replicas);
+
+VSegmentLayoutEntry MakeTestLayoutEntry() {
+    VSegmentLayoutEntry entry;
+    entry.vsegment_id = "vs-1";
+    entry.partition_id = "partition-1";
+    entry.stripe_size = 4096;
+    entry.logical_capacity = 8192;
+    entry.mapping_algorithm = 0;
+    entry.checksum = 0x1234;
+    entry.members.push_back(
+        {"seg-1", 0, 8192, "127.0.0.1:19000", 0x100000});
+    return entry;
+}
+
+TEST(VSegmentLayoutWireTest, LegacyGetReplicaListDecodesWithoutLayout) {
+    LegacyGetReplicaListResponse legacy{{}, 17, 42};
+    const auto bytes = struct_pack::serialize(legacy);
+    GetReplicaListResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.lease_ttl_ms, 17u);
+    ASSERT_TRUE(decoded.object_checksum.has_value());
+    EXPECT_EQ(*decoded.object_checksum, 42u);
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+TEST(VSegmentLayoutWireTest, NewGetReplicaListIsReadableByLegacyReader) {
+    GetReplicaListResponse response;
+    response.lease_ttl_ms = 17;
+    response.object_checksum = 42;
+    response.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(response);
+    LegacyGetReplicaListResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.lease_ttl_ms, 17u);
+    ASSERT_TRUE(decoded.object_checksum.has_value());
+    EXPECT_EQ(*decoded.object_checksum, 42u);
+}
+
+TEST(VSegmentLayoutWireTest, OldPutStartDecodesWithoutLayout) {
+    LegacyPutStartResult legacy{"op-1", {}};
+    const auto bytes = struct_pack::serialize(legacy);
+    PutStartResult decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.operation_id, "op-1");
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+TEST(VSegmentLayoutWireTest, BatchResponseRoundTripKeepsDedupTable) {
+    BatchGetReplicaListResponse batch;
+    batch.results.push_back(GetReplicaListResponse{});
+    batch.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(batch);
+    BatchGetReplicaListResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_TRUE(decoded.vsegment_layouts.has_value());
+    ASSERT_EQ(decoded.vsegment_layouts->size(), 1u);
+    EXPECT_EQ(decoded.vsegment_layouts->front().vsegment_id, "vs-1");
+    ASSERT_EQ(decoded.vsegment_layouts->front().members.size(), 1u);
+    EXPECT_EQ(decoded.vsegment_layouts->front().members.front().endpoint,
+              "127.0.0.1:19000");
+}
+
+TEST(VSegmentLayoutWireTest, CachedQueryResultMapRoundTripKeepsLayout) {
+    CachedQueryResultResponse cached{GetReplicaListResponse{}};
+    cached.value.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    std::map<std::string, CachedQueryResultResponse> cache;
+    cache.emplace("key-1", std::move(cached));
+
+    const auto bytes = struct_pack::serialize(cache);
+    std::map<std::string, CachedQueryResultResponse> decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.count("key-1"), 1u);
+    ASSERT_TRUE(decoded.at("key-1").value.vsegment_layouts.has_value());
+    EXPECT_EQ(decoded.at("key-1").value.vsegment_layouts->front().vsegment_id,
+              "vs-1");
 }
 
 TEST(VSegmentRouteStoreTest, RouteSerializationRoundTrip) {

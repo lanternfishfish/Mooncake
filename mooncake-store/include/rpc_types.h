@@ -2,6 +2,9 @@
 
 #include <optional>
 
+#include <tl/expected.hpp>
+#include <ylt/struct_pack/compatible.hpp>
+
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
@@ -13,6 +16,34 @@ struct ObjectMeta {
     std::optional<uint64_t> object_checksum;
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
+
+// Runtime-resolved location of one vsegment member. Only filled for vsegment
+// replicas; ordinary memory/NoF/disk replicas carry their own endpoint/base in
+// Replica::Descriptor.
+struct VSegmentLayoutMember {
+    std::string segment_id;
+    uint64_t base_offset{0};
+    uint64_t length{0};
+    std::string endpoint;
+    uint64_t base_address{0};
+};
+YLT_REFL(VSegmentLayoutMember, segment_id, base_offset, length, endpoint,
+         base_address);
+
+// Deduplicated per-vsegment layout carried alongside replica descriptors.
+// The layout is immutable; endpoint/base are runtime values resolved by the
+// owner master when the response is built.
+struct VSegmentLayoutEntry {
+    std::string vsegment_id;
+    std::string partition_id;
+    uint64_t stripe_size{0};
+    uint64_t logical_capacity{0};
+    uint32_t mapping_algorithm{0};
+    uint32_t checksum{0};
+    std::vector<VSegmentLayoutMember> members;
+};
+YLT_REFL(VSegmentLayoutEntry, vsegment_id, partition_id, stripe_size,
+         logical_capacity, mapping_algorithm, checksum, members);
 
 /**
  * @brief Response structure for Ping operation
@@ -41,6 +72,9 @@ struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
     std::optional<uint64_t> object_checksum;
+    // Only entries for vsegment replicas in `replicas`; empty otherwise.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -51,7 +85,8 @@ struct GetReplicaListResponse {
           lease_ttl_ms(lease_ttl_ms_param),
           object_checksum(object_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
+         vsegment_layouts);
 
 /**
  * @brief PutStart 响应（vsegment 两阶段写预留接口）。
@@ -61,6 +96,9 @@ YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 struct PutStartResult {
     std::string operation_id;
     std::vector<Replica::Descriptor> replicas;
+    // Only entries for vsegment replicas in `replicas`; empty otherwise.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 
     PutStartResult() = default;
     PutStartResult(std::string operation_id_param,
@@ -68,7 +106,32 @@ struct PutStartResult {
         : operation_id(std::move(operation_id_param)),
           replicas(std::move(replicas_param)) {}
 };
-YLT_REFL(PutStartResult, operation_id, replicas);
+YLT_REFL(PutStartResult, operation_id, replicas, vsegment_layouts);
+
+// Batch envelopes: the per-key results stay unchanged; the layout table is
+// deduplicated across the whole batch.
+struct BatchGetReplicaListResponse {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
+};
+YLT_REFL(BatchGetReplicaListResponse, results, vsegment_layouts);
+
+struct BatchPutStartResponse {
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results;
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
+};
+YLT_REFL(BatchPutStartResponse, results, vsegment_layouts);
+
+struct BatchUpsertStartResponse {
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results;
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
+};
+YLT_REFL(BatchUpsertStartResponse, results, vsegment_layouts);
 
 struct CachedQueryResultResponse {
     bool success;
