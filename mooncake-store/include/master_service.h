@@ -214,6 +214,10 @@ class MasterService {
     // omitted; callers fall back to GetVSegmentView/GetPSegmentEndpoint.
     std::vector<VSegmentLayoutEntry> BuildVSegmentLayoutTable(
         const std::vector<std::pair<std::string, std::string>>& vsegments);
+    // Attaches the runtime layout table for the vsegment replicas contained in
+    // `response`. No-op when the response has no vsegment replica or when the
+    // table cannot be resolved (best-effort; the client falls back).
+    void EnrichVSegmentLayouts(GetReplicaListResponse* response);
     void InvalidateVSegmentLayoutCache();
     vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,
@@ -589,6 +593,15 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const TenantId& tenant_id);
+
+    /**
+     * @brief Same as BatchGetReplicaList, but returns the batch envelope with
+     * the deduplicated vsegment layout table (local entries + tables relayed
+     * by peer masters). The vector-only variant above is kept for internal
+     * callers that do not consume layouts.
+     */
+    BatchGetReplicaListResponse BatchGetReplicaListWithLayouts(
+        const std::vector<std::string>& keys, const TenantId& tenant_id);
 
     /**
      * @brief Read-only batch replica list query for admin use.

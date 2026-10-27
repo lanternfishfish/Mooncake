@@ -609,7 +609,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     // Test BatchPutStart request
     auto batch_put_start_result =
         service_.BatchPutStart(client_id, keys, value_lengths, config);
-    ASSERT_EQ(batch_put_start_result.size(), 3);
+    ASSERT_EQ(batch_put_start_result.results.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 0);
     ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
@@ -618,7 +618,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     // Test BatchGetReplicaList request (should all fail)
     auto batch_get_replica_result = service_.BatchGetReplicaList(keys);
-    ASSERT_EQ(batch_get_replica_result.size(), 3);
+    ASSERT_EQ(batch_get_replica_result.results.size(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
     ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
@@ -650,7 +650,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     // Test BatchGetReplicaList again (should all succeed now)
     auto batch_get_replica_result2 = service_.BatchGetReplicaList(keys);
-    ASSERT_EQ(batch_get_replica_result2.size(), 3);
+    ASSERT_EQ(batch_get_replica_result2.results.size(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 2);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
     ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
@@ -670,7 +670,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     keys.push_back("test_key4");
     value_lengths.push_back(512);
     auto batch_get_replica_result3 = service_.BatchGetReplicaList(keys);
-    ASSERT_EQ(batch_get_replica_result3.size(), 4);
+    ASSERT_EQ(batch_get_replica_result3.results.size(), 4);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 1);
     ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
@@ -679,7 +679,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     auto batch_put_start_result2 =
         service_.BatchPutStart(client_id, keys, value_lengths, config);
-    ASSERT_EQ(batch_put_start_result2.size(), 4);
+    ASSERT_EQ(batch_put_start_result2.results.size(), 4);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 1);
     ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);

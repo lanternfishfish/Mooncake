@@ -1504,7 +1504,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     pt.Start();
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
+    auto batch_response =
+        master_client_.BatchGetReplicaList(object_keys, tenant_id);
+    auto& response = batch_response.results;
 
     // 松耦合重路由：任一项返回 SLOT_NOT_OWNED 说明视图过期，刷新一次后
     // 整体重试；读操作幂等，重复查询已成功项无害。
@@ -1528,7 +1530,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             pt_refresh.Start();
             TryLoadRoutingOnce();
             pt_refresh.End(0);
-            response =
+            batch_response =
                 master_client_.BatchGetReplicaList(object_keys, tenant_id);
         }
     }
@@ -1546,6 +1548,12 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         pt.End(-1);
         return results;
     }
+    // 整个批次共享同一张去重表；旧 master 没有 envelope 表时退回逐 key。
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
+    if (batch_response.vsegment_layouts.has_value()) {
+        batch_layouts = std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+            *batch_response.vsegment_layouts);
+    }
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
@@ -1555,7 +1563,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
                 response[i].value().object_checksum);
-            query.vsegment_layouts = MakeVSegmentLayouts(response[i].value());
+            query.vsegment_layouts =
+                batch_layouts ? batch_layouts
+                              : MakeVSegmentLayouts(response[i].value());
             results.emplace_back(std::move(query));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
@@ -2060,7 +2070,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
             }
             auto plan = vsegment_transfer_planner_->Plan(
-                replica.get_vsegment_descriptor(), client_slices);
+                replica.get_vsegment_descriptor(), client_slices,
+                query_result.vsegment_layouts.get());
             if (!plan) {
                 results[i] = tl::unexpected(plan.error);
                 continue;
@@ -2623,6 +2634,9 @@ class PutOperation {
     PutOperationState state = PutOperationState::PENDING;
     tl::expected<void, ErrorCode> result;
     std::vector<Replica::Descriptor> replicas;
+    // 方案 C：批次响应带回的去重 vsegment layout 表；同批次的所有 op 共享
+    // 同一个 shared_ptr（只在 StartBatchPut/StartBatchUpsert 里构造一次）。
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> vsegment_layouts;
     std::vector<PendingTransferRecord> pending_transfers;
 
     size_t requested_memory_replicas = 0;
@@ -2787,8 +2801,15 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     SpDiag::PerfPoint pt_batch_start(PerfKey::PUT_BATCH_PUT_START,
                                      SpDiag::PerfLevel::MODULE);
     pt_batch_start.Start();
-    auto start_responses =
+    auto start_response =
         master_client_.BatchPutStart(keys, slice_lengths, config);
+    auto& start_responses = start_response.results;
+    // 整个批次共享同一张去重表。
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
+    if (start_response.vsegment_layouts.has_value()) {
+        batch_layouts = std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+            *start_response.vsegment_layouts);
+    }
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2819,6 +2840,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 "Master failed to start put operation");
         } else {
             op.replicas = start_responses[i].value();
+            op.vsegment_layouts = batch_layouts;
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2872,8 +2894,14 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         return;
     }
 
-    auto start_responses =
+    auto start_response =
         master_client_.BatchUpsertStart(keys, slice_lengths, config);
+    auto& start_responses = start_response.results;
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
+    if (start_response.vsegment_layouts.has_value()) {
+        batch_layouts = std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+            *start_response.vsegment_layouts);
+    }
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2897,6 +2925,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                         "Master failed to start upsert operation");
         } else {
             op.replicas = start_responses[i].value();
+            op.vsegment_layouts = batch_layouts;
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2995,7 +3024,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                              slice.size});
                     }
                     auto plan = vsegment_transfer_planner_->Plan(
-                        replica.get_vsegment_descriptor(), client_slices);
+                        replica.get_vsegment_descriptor(), client_slices,
+                        op.vsegment_layouts.get());
                     if (!plan) {
                         op.transfer_summary.RecordFailure(replica_type,
                                                           plan.error);

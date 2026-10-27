@@ -7253,11 +7253,13 @@ std::vector<VSegmentLayoutEntry> MasterService::BuildVSegmentLayoutTable(
     std::vector<VSegmentLayoutEntry> result;
     if (!VSegmentInlineLayoutEnabled()) return result;
 
-    std::shared_ptr<vsegment::VSegmentService> service;
-    {
-        std::lock_guard<std::mutex> lock(vsegment_service_init_mutex_);
-        service = vsegment_service_;
-    }
+    // 锁序：本函数在 GetReplicaListLocal/ForAdmin 的末尾被调用，此时
+    // snapshot_mutex_（共享）仍被持有；而 vsegment 首建线程持有
+    // vsegment_service_init_mutex_ 期间会做 reconcile。若这里再取 init
+    // mutex 就构成 S→I 与 I→S 的反向锁序。vsegment_service_ 是一次性发布、
+    // 永不重置的 shared_ptr（与心跳快路径的无锁空判同前提），因此直接拷贝，
+    // 不取 init mutex。
+    std::shared_ptr<vsegment::VSegmentService> service = vsegment_service_;
     if (!service) return result;
 
     std::unordered_set<std::string> seen;
@@ -7522,24 +7524,26 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     (void)record_io_access;
     (void)io_access;
     pt_total.End(0);
-    {
-        // Enrich only when the response contains vsegment replicas; ordinary
-        // replicas already carry their own endpoint/base.
-        std::vector<std::pair<std::string, std::string>> vsegments;
-        for (const auto& replica : resp.replicas) {
-            if (!replica.is_vsegment_replica()) continue;
-            const auto& descriptor = replica.get_vsegment_descriptor();
-            vsegments.emplace_back(descriptor.partition_id,
-                                   descriptor.vsegment_id);
-        }
-        if (!vsegments.empty()) {
-            auto layouts = BuildVSegmentLayoutTable(vsegments);
-            if (!layouts.empty()) {
-                resp.vsegment_layouts = std::move(layouts);
-            }
-        }
-    }
+    EnrichVSegmentLayouts(&resp);
     return resp;
+}
+
+void MasterService::EnrichVSegmentLayouts(GetReplicaListResponse* response) {
+    if (response == nullptr) return;
+    // Enrich only when the response contains vsegment replicas; ordinary
+    // replicas already carry their own endpoint/base.
+    std::vector<std::pair<std::string, std::string>> vsegments;
+    for (const auto& replica : response->replicas) {
+        if (!replica.is_vsegment_replica()) continue;
+        const auto& descriptor = replica.get_vsegment_descriptor();
+        vsegments.emplace_back(descriptor.partition_id,
+                               descriptor.vsegment_id);
+    }
+    if (vsegments.empty()) return;
+    auto layouts = BuildVSegmentLayoutTable(vsegments);
+    if (!layouts.empty()) {
+        response->vsegment_layouts = std::move(layouts);
+    }
 }
 
 auto MasterService::GetReplicaListForAdmin(const std::string& key,
@@ -7568,23 +7572,26 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_,
-                                  metadata.object_checksum);
+    GetReplicaListResponse response(std::move(replica_list),
+                                    default_kv_lease_ttl_,
+                                    metadata.object_checksum);
+    EnrichVSegmentLayouts(&response);
+    return response;
 }
 
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
-                                   const TenantId& tenant_id) {
+BatchGetReplicaListResponse MasterService::BatchGetReplicaListWithLayouts(
+    const std::vector<std::string>& keys, const TenantId& tenant_id) {
     using GetResult = tl::expected<GetReplicaListResponse, ErrorCode>;
 
     assert(tenant_id.IsValid());
 
-    std::vector<GetResult> results(
+    BatchGetReplicaListResponse response;
+    response.results.assign(
         keys.size(), tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
     if (keys.empty()) {
-        return results;
+        return response;
     }
+    auto& results = response.results;
 
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
 
@@ -7633,6 +7640,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     }
 
 #ifdef STORE_USE_ETCD
+    std::vector<VSegmentLayoutEntry> layouts;
     for (const auto& [owner, indices] : forward_groups) {
         std::vector<std::string> group_keys;
         group_keys.reserve(indices.size());
@@ -7641,13 +7649,45 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
         auto group_result = inter_master_rpc_->BatchGetReplicaList(
             owner, group_keys, normalized_tenant.value());
-        for (size_t j = 0; j < indices.size() && j < group_result.size(); ++j) {
-            results[indices[j]] = std::move(group_result[j]);
+        for (size_t j = 0;
+             j < indices.size() && j < group_result.results.size(); ++j) {
+            results[indices[j]] = std::move(group_result.results[j]);
+        }
+        if (group_result.vsegment_layouts.has_value()) {
+            MergeVSegmentLayoutTable(layouts, *group_result.vsegment_layouts);
         }
     }
+#else
+    std::vector<VSegmentLayoutEntry> layouts;
 #endif
 
-    return results;
+    // 本地组：视图只由本机 vsegment service 持有，故本机解析；转发组的表
+    // 已由 owner 在转发响应里带回（上面的 layouts）。两端按 vsegment_id 去重。
+    std::vector<std::pair<std::string, std::string>> local_vsegments;
+    for (size_t idx : local_indices) {
+        const auto& result = results[idx];
+        if (!result) continue;
+        for (const auto& replica : result->replicas) {
+            if (!replica.is_vsegment_replica()) continue;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            local_vsegments.emplace_back(descriptor.partition_id,
+                                         descriptor.vsegment_id);
+        }
+    }
+    if (!local_vsegments.empty()) {
+        auto local_layouts = BuildVSegmentLayoutTable(local_vsegments);
+        MergeVSegmentLayoutTable(layouts, local_layouts);
+    }
+    if (!layouts.empty()) {
+        response.vsegment_layouts = std::move(layouts);
+    }
+    return response;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
+                                   const TenantId& tenant_id) {
+    return BatchGetReplicaListWithLayouts(keys, tenant_id).results;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>

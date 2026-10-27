@@ -245,7 +245,7 @@ class BenchClient {
 
     uint64_t BatchGet(const std::vector<std::string>& keys) {
         uint64_t success_cnt = 0;
-        auto get_results = master_client_.BatchGetReplicaList(keys);
+        auto get_results = master_client_.BatchGetReplicaList(keys).results;
         for (auto& get_result : get_results) {
             if (get_result.has_value() ||
                 get_result.error() == mooncake::ErrorCode::OBJECT_NOT_FOUND) {

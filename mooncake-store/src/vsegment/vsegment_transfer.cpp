@@ -124,17 +124,25 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
             candidate.stripe_size = it->stripe_size;
             candidate.logical_capacity = it->logical_capacity;
             candidate.members.reserve(it->members.size());
+            bool endpoints_ok = true;
             for (const auto& member : it->members) {
                 candidate.members.push_back(
                     PSegmentExtent{member.segment_id, member.base_offset,
                                    member.length});
+                if (member.endpoint.empty()) {
+                    // Unmounted segment (e.g. standby recovery): the entry is
+                    // unusable, fall back to the legacy resolution path.
+                    endpoints_ok = false;
+                    break;
+                }
                 layout_locations[member.segment_id] =
                     PSegmentLocation{member.endpoint, member.base_address};
             }
             candidate.checksum = it->checksum;
             std::string validation_detail;
-            if (ValidateViewStructure(candidate, &validation_detail) ==
-                ErrorCode::OK) {
+            if (endpoints_ok &&
+                ValidateViewStructure(candidate, &validation_detail) ==
+                    ErrorCode::OK) {
                 view = std::move(candidate);
                 use_layout = true;
             } else {

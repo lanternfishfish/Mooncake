@@ -200,6 +200,96 @@ TEST(VSegmentLayoutWireTest, CachedQueryResultMapRoundTripKeepsLayout) {
               "vs-1");
 }
 
+TEST(VSegmentLayoutWireTest, BatchEnvelopeIsReadableByLegacyVectorReader) {
+    BatchGetReplicaListResponse batch;
+    batch.results.push_back(GetReplicaListResponse{});
+    batch.results.push_back(
+        tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    batch.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(batch);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.size(), 2u);
+    EXPECT_TRUE(decoded[0].has_value());
+    ASSERT_FALSE(decoded[1].has_value());
+    EXPECT_EQ(decoded[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST(VSegmentLayoutWireTest, LegacyBatchVectorDecodesAsEnvelope) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> legacy;
+    legacy.push_back(GetReplicaListResponse{});
+    legacy.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    const auto bytes = struct_pack::serialize(legacy);
+
+    BatchGetReplicaListResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.results.size(), 2u);
+    EXPECT_TRUE(decoded.results[0].has_value());
+    EXPECT_FALSE(decoded.results[1].has_value());
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+TEST(VSegmentLayoutWireTest, BatchPutStartEnvelopeBothDirections) {
+    BatchPutStartResponse batch;
+    batch.results.push_back(std::vector<Replica::Descriptor>{});
+    batch.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(batch);
+
+    // New writer -> legacy reader (bare vector).
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        legacy;
+    ASSERT_EQ(struct_pack::deserialize_to(legacy, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(legacy.size(), 1u);
+    EXPECT_TRUE(legacy[0].has_value());
+
+    // Legacy writer -> new reader.
+    const auto legacy_bytes = struct_pack::serialize(legacy);
+    BatchPutStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, legacy_bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.results.size(), 1u);
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+TEST(VSegmentLayoutWireTest, BatchUpsertEnvelopeRoundTripKeepsDedupTable) {
+    BatchUpsertStartResponse batch;
+    batch.results.push_back(
+        tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+    batch.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(batch);
+
+    BatchUpsertStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.results.size(), 1u);
+    ASSERT_FALSE(decoded.results[0].has_value());
+    ASSERT_TRUE(decoded.vsegment_layouts.has_value());
+    EXPECT_EQ(decoded.vsegment_layouts->front().vsegment_id, "vs-1");
+}
+
+TEST(VSegmentLayoutWireTest, MergeVSegmentLayoutTableDeduplicates) {
+    std::vector<VSegmentLayoutEntry> target;
+    auto first = MakeTestLayoutEntry();
+    MergeVSegmentLayoutTable(target, {first});
+    auto duplicate = MakeTestLayoutEntry();
+    duplicate.members.front().endpoint = "other:1";
+    MergeVSegmentLayoutTable(target, {duplicate});
+    ASSERT_EQ(target.size(), 1u);
+    EXPECT_EQ(target.front().members.front().endpoint, "127.0.0.1:19000");
+
+    auto second = MakeTestLayoutEntry();
+    second.vsegment_id = "vs-2";
+    MergeVSegmentLayoutTable(target, {second});
+    ASSERT_EQ(target.size(), 2u);
+}
+
 TEST(VSegmentRouteStoreTest, RouteSerializationRoundTrip) {
     partition::PartitionRoute route{
         {"partition-7"}, "submaster-a", 9,
@@ -683,6 +773,112 @@ TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
     ASSERT_TRUE(plan) << plan.detail;
     ASSERT_EQ(plan.requests.size(), 8u);
     EXPECT_EQ(endpoints.resolves, 2);
+}
+
+VSegmentLayoutEntry MakeLayoutEntryFromView(const VSegmentView& view,
+                                            uint64_t base_address) {
+    VSegmentLayoutEntry entry;
+    entry.vsegment_id = view.vsegment_id;
+    entry.partition_id = view.partition_id;
+    entry.stripe_size = view.stripe_size;
+    entry.logical_capacity = view.logical_capacity;
+    entry.mapping_algorithm = static_cast<uint32_t>(view.mapping_algorithm);
+    entry.checksum = view.checksum;
+    entry.members.reserve(view.members.size());
+    for (const auto& member : view.members) {
+        entry.members.push_back({member.segment_id, member.base_offset,
+                                 member.length,
+                                 "inline://" + member.segment_id,
+                                 base_address});
+    }
+    return entry;
+}
+
+TEST(VSegmentTransferPlannerTest, UsesInlineLayoutWithoutRpc) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    std::vector<VSegmentLayoutEntry> layouts{MakeLayoutEntryFromView(
+        allocation.view, /*base_address=*/0x200000)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    ASSERT_TRUE(plan) << plan.detail;
+    ASSERT_EQ(plan.requests.size(), 3u);
+    EXPECT_EQ(plan.requests[0].endpoint, "inline://segment-a");
+    EXPECT_EQ(plan.requests[0].transfer.physical_offset, 0x200000 + 48);
+    EXPECT_EQ(endpoints.resolves, 0);
+    EXPECT_EQ(provider.loads, 0);
+    VSegmentView unused;
+    EXPECT_FALSE(cache.Find(replica.partition_id, replica.vsegment_id, &unused));
+}
+
+TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutChecksumMismatch) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    entry.checksum ^= 1;
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    ASSERT_TRUE(plan) << plan.detail;
+    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
+    EXPECT_EQ(provider.loads, 1);
+    EXPECT_EQ(endpoints.resolves, 2);
+}
+
+TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutMemberHasNoEndpoint) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    ASSERT_FALSE(entry.members.empty());
+    entry.members.front().endpoint.clear();
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    ASSERT_TRUE(plan) << plan.detail;
+    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
+    EXPECT_EQ(provider.loads, 1);
+    EXPECT_EQ(endpoints.resolves, 2);
+}
+
+TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutHasNoMatchingVSegment) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    entry.vsegment_id = "vs-other";
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    ASSERT_TRUE(plan) << plan.detail;
+    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
+    EXPECT_EQ(provider.loads, 1);
 }
 
 TEST(VSegmentTransferPlannerTest, RejectsAbsoluteAddressOverflow) {

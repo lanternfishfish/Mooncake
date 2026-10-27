@@ -133,6 +133,24 @@ struct BatchUpsertStartResponse {
 };
 YLT_REFL(BatchUpsertStartResponse, results, vsegment_layouts);
 
+// Appends `incoming` to `target`, keeping the first entry per vsegment_id.
+// Used to merge tables built by different masters (route groups) into the
+// table of one batch response.
+inline void MergeVSegmentLayoutTable(
+    std::vector<VSegmentLayoutEntry>& target,
+    const std::vector<VSegmentLayoutEntry>& incoming) {
+    for (const auto& entry : incoming) {
+        bool exists = false;
+        for (const auto& existing : target) {
+            if (existing.vsegment_id == entry.vsegment_id) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) target.push_back(entry);
+    }
+}
+
 struct CachedQueryResultResponse {
     bool success;
     GetReplicaListResponse value;
