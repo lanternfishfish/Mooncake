@@ -2177,6 +2177,159 @@ TEST(VSegmentIntegrationTest, OrdinaryPutReturnsAndCommitsVSegmentReplica) {
     EXPECT_TRUE(loaded->replicas.front().is_vsegment_replica());
 }
 
+TEST(VSegmentLayoutMasterTest, BatchAndSingleResponsesCarryResolvedLayouts) {
+    const std::string key = "layout-master-batch";
+    const auto& tenant = TenantId::Default();
+    const std::string partition_id =
+        std::to_string(cvm::KeySlot(tenant, key));
+    const UUID segment_a = generate_uuid();
+    const UUID segment_b = generate_uuid();
+
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {{partition_id,
+                     "default",
+                     "DRAM",
+                     {{UuidToString(segment_a), 0, 512},
+                      {UuidToString(segment_b), 0, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 10000;
+    MasterService master(config);
+    master.SetVSegmentService(vsegments);
+
+    const UUID client = generate_uuid();
+    Segment mounted_a;
+    mounted_a.id = segment_a;
+    mounted_a.name = "layout-seg-a";
+    mounted_a.base = 0x400000;
+    mounted_a.size = 1 << 20;
+    mounted_a.te_endpoint = "10.0.0.1:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_a, client).has_value());
+    Segment mounted_b;
+    mounted_b.id = segment_b;
+    mounted_b.name = "layout-seg-b";
+    mounted_b.base = 0x500000;
+    mounted_b.size = 1 << 20;
+    mounted_b.te_endpoint = "10.0.0.2:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_b, client).has_value());
+
+    ReplicateConfig replicas;
+    replicas.replica_num = 1;
+    tl::expected<std::optional<PutStartResult>, ErrorCode> started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = master.TryVSegmentPutStart(client, key, tenant, 64, replicas);
+        if (started && started->has_value()) break;
+        if (!started && started.error() != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started.has_value());
+    ASSERT_TRUE(started->has_value());
+    const auto& replica = (**started).replicas.front();
+    ASSERT_TRUE(replica.is_vsegment_replica());
+    const std::string vsegment_id =
+        replica.get_vsegment_descriptor().vsegment_id;
+    // Phase 2: the single PutStart response already carries the table.
+    ASSERT_TRUE((**started).vsegment_layouts.has_value());
+    EXPECT_EQ((**started).vsegment_layouts->front().vsegment_id, vsegment_id);
+
+    ObjectMeta object{key, std::nullopt};
+    ASSERT_TRUE(master.PutEnd(client, object, tenant, ReplicaType::MEMORY,
+                              (**started).operation_id));
+
+    // Batch envelope: the deduplicated table is attached at the wrapper.
+    auto batch = master.BatchGetReplicaListWithLayouts({key}, tenant);
+    ASSERT_EQ(batch.results.size(), 1u);
+    ASSERT_TRUE(batch.results[0].has_value());
+    ASSERT_TRUE(batch.vsegment_layouts.has_value());
+    const auto& entry = batch.vsegment_layouts->front();
+    EXPECT_EQ(entry.vsegment_id, vsegment_id);
+    EXPECT_EQ(entry.partition_id, partition_id);
+    ASSERT_EQ(entry.members.size(), 2u);
+    EXPECT_EQ(entry.members[0].endpoint, "10.0.0.1:12345");
+    EXPECT_EQ(entry.members[0].base_address, 0x400000u);
+    EXPECT_EQ(entry.members[1].endpoint, "10.0.0.2:12345");
+    EXPECT_EQ(entry.members[1].base_address, 0x500000u);
+
+    // Cache: a second call returns the same single entry (no duplicate).
+    auto cached = master.BatchGetReplicaListWithLayouts({key, key}, tenant);
+    ASSERT_TRUE(cached.vsegment_layouts.has_value());
+    EXPECT_EQ(cached.vsegment_layouts->size(), 1u);
+
+    // The vector-only API keeps working but does not attach tables.
+    auto legacy = master.BatchGetReplicaList({key}, tenant);
+    ASSERT_EQ(legacy.size(), 1u);
+    EXPECT_TRUE(legacy[0].has_value());
+    EXPECT_FALSE(legacy[0]->vsegment_layouts.has_value());
+
+    // Single read also carries the table.
+    auto loaded = master.GetReplicaList(key, tenant);
+    ASSERT_TRUE(loaded.has_value());
+    ASSERT_TRUE(loaded->vsegment_layouts.has_value());
+    EXPECT_EQ(loaded->vsegment_layouts->front().vsegment_id, vsegment_id);
+}
+
+TEST(VSegmentLayoutMasterTest, UnmountInvalidatesCachedLayouts) {
+    const std::string partition_id = "partition-layout-unmount";
+    const UUID segment_a = generate_uuid();
+    const UUID segment_b = generate_uuid();
+
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {{partition_id,
+                     "default",
+                     "DRAM",
+                     {{UuidToString(segment_a), 0, 512},
+                      {UuidToString(segment_b), 0, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = vsegments->StartPut(partition_id, 1, "layout-unmount", 64);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+
+    MasterServiceConfig config;
+    MasterService master(config);
+    master.SetVSegmentService(vsegments);
+    const UUID client = generate_uuid();
+    Segment mounted_a;
+    mounted_a.id = segment_a;
+    mounted_a.name = "u-seg-a";
+    mounted_a.base = 0x400000;
+    mounted_a.size = 1 << 20;
+    mounted_a.te_endpoint = "10.0.0.1:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_a, client).has_value());
+    Segment mounted_b;
+    mounted_b.id = segment_b;
+    mounted_b.name = "u-seg-b";
+    mounted_b.base = 0x500000;
+    mounted_b.size = 1 << 20;
+    mounted_b.te_endpoint = "10.0.0.2:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_b, client).has_value());
+
+    auto table = master.BuildVSegmentLayoutTable(
+        {{partition_id, started.replica.vsegment_id}});
+    ASSERT_EQ(table.size(), 1u);
+
+    ASSERT_TRUE(master.UnmountSegment(segment_a, client).has_value());
+    auto after = master.BuildVSegmentLayoutTable(
+        {{partition_id, started.replica.vsegment_id}});
+    EXPECT_TRUE(after.empty());
+}
+
 TEST(VSegmentIntegrationTest, OrdinaryMemoryRevokeRemovesVSegmentReplica) {
     const std::string key = "ordinary-vsegment-revoke";
     const auto& tenant = TenantId::Default();
