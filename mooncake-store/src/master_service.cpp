@@ -1069,10 +1069,25 @@ MasterService::TryVSegmentPutStart(
     it->second.reserved_quota_charge_bytes = quota_charge;
     RegisterGroupMember(tenant_state, *normalized, key, group_id);
     tenant_state.processing_keys.insert(key);
-    return std::optional<PutStartResult>(
-        PutStartResult{operation_ids.size() == 1 ? operation_ids.front()
-                                                : std::string{},
-                       std::move(descriptors)});
+    PutStartResult result{
+        operation_ids.size() == 1 ? operation_ids.front() : std::string{},
+        std::move(descriptors)};
+    {
+        std::vector<std::pair<std::string, std::string>> vsegments;
+        for (const auto& replica : result.replicas) {
+            if (!replica.is_vsegment_replica()) continue;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            vsegments.emplace_back(descriptor.partition_id,
+                                   descriptor.vsegment_id);
+        }
+        if (!vsegments.empty()) {
+            auto layouts = BuildVSegmentLayoutTable(vsegments);
+            if (!layouts.empty()) {
+                result.vsegment_layouts = std::move(layouts);
+            }
+        }
+    }
+    return std::optional<PutStartResult>(std::move(result));
 }
 
 void MasterService::KickSlotHeartbeat() {
@@ -4504,6 +4519,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     // 旧代清理各段耗时。
     const auto mount_t0 = std::chrono::steady_clock::now();
     ErrorCode mount_result = ErrorCode::OK;
+    InvalidateVSegmentLayoutCache();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     {
         ScopedSegmentAccess segment_access =
@@ -4692,6 +4708,7 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    InvalidateVSegmentLayoutCache();
     std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
@@ -6158,6 +6175,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
+    InvalidateVSegmentLayoutCache();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // 1. Prepare to unmount the segment by deleting its allocator
     {
@@ -6212,6 +6230,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 auto MasterService::GracefulUnmountSegment(
     const UUID& segment_id, const UUID& client_id,
     uint64_t grace_period_ms) -> tl::expected<void, ErrorCode> {
+    InvalidateVSegmentLayoutCache();
     std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
@@ -7212,6 +7231,90 @@ MasterService::GetPSegmentEndpoint(const std::string& segment_id) {
         segment.te_endpoint, static_cast<uint64_t>(segment.base)};
 }
 
+namespace {
+bool VSegmentInlineLayoutEnabled() {
+    const char* env = std::getenv("MC_VSEGMENT_INLINE_LAYOUT");
+    if (env == nullptr) return true;
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return !(value == "0" || value == "false" || value == "no" ||
+             value == "off");
+}
+}  // namespace
+
+void MasterService::InvalidateVSegmentLayoutCache() {
+    std::lock_guard<std::mutex> lock(vsegment_layout_cache_mutex_);
+    vsegment_layout_cache_.clear();
+}
+
+std::vector<VSegmentLayoutEntry> MasterService::BuildVSegmentLayoutTable(
+    const std::vector<std::pair<std::string, std::string>>& vsegments) {
+    std::vector<VSegmentLayoutEntry> result;
+    if (!VSegmentInlineLayoutEnabled()) return result;
+
+    std::shared_ptr<vsegment::VSegmentService> service;
+    {
+        std::lock_guard<std::mutex> lock(vsegment_service_init_mutex_);
+        service = vsegment_service_;
+    }
+    if (!service) return result;
+
+    std::unordered_set<std::string> seen;
+    for (const auto& [partition_id, vsegment_id] : vsegments) {
+        if (!seen.insert(vsegment_id).second) continue;
+        {
+            std::lock_guard<std::mutex> lock(vsegment_layout_cache_mutex_);
+            auto found = vsegment_layout_cache_.find(vsegment_id);
+            if (found != vsegment_layout_cache_.end()) {
+                result.push_back(found->second);
+                continue;
+            }
+        }
+        vsegment::VSegmentView view;
+        auto rc = service->LoadView(partition_id, vsegment_id, &view);
+        if (rc != ErrorCode::OK) continue;
+        std::vector<UUID> member_ids;
+        member_ids.reserve(view.members.size());
+        bool ids_ok = true;
+        for (const auto& member : view.members) {
+            UUID id;
+            if (!StringToUuid(member.segment_id, id)) {
+                ids_ok = false;
+                break;
+            }
+            member_ids.push_back(id);
+        }
+        if (!ids_ok) continue;
+        std::vector<std::string> endpoints;
+        std::vector<uint64_t> bases;
+        if (!segment_manager_.GetSegmentLocations(member_ids, &endpoints,
+                                                  &bases)) {
+            continue;
+        }
+        VSegmentLayoutEntry entry;
+        entry.vsegment_id = view.vsegment_id;
+        entry.partition_id = view.partition_id;
+        entry.stripe_size = view.stripe_size;
+        entry.logical_capacity = view.logical_capacity;
+        entry.mapping_algorithm =
+            static_cast<uint32_t>(view.mapping_algorithm);
+        entry.checksum = view.checksum;
+        entry.members.reserve(view.members.size());
+        for (size_t i = 0; i < view.members.size(); ++i) {
+            entry.members.push_back(
+                {view.members[i].segment_id, view.members[i].base_offset,
+                 view.members[i].length, endpoints[i], bases[i]});
+        }
+        {
+            std::lock_guard<std::mutex> lock(vsegment_layout_cache_mutex_);
+            vsegment_layout_cache_[vsegment_id] = entry;
+        }
+        result.push_back(std::move(entry));
+    }
+    return result;
+}
+
 vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
     const std::string& partition_id, uint64_t route_epoch,
     const std::string& operation_id, uint64_t length,
@@ -7419,6 +7522,23 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     (void)record_io_access;
     (void)io_access;
     pt_total.End(0);
+    {
+        // Enrich only when the response contains vsegment replicas; ordinary
+        // replicas already carry their own endpoint/base.
+        std::vector<std::pair<std::string, std::string>> vsegments;
+        for (const auto& replica : resp.replicas) {
+            if (!replica.is_vsegment_replica()) continue;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            vsegments.emplace_back(descriptor.partition_id,
+                                   descriptor.vsegment_id);
+        }
+        if (!vsegments.empty()) {
+            auto layouts = BuildVSegmentLayoutTable(vsegments);
+            if (!layouts.empty()) {
+                resp.vsegment_layouts = std::move(layouts);
+            }
+        }
+    }
     return resp;
 }
 
