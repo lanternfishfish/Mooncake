@@ -243,7 +243,10 @@ class MasterServiceHATest : public ::testing::Test {
         service.cvm_last_primary_ids_ = {service.master_id()};
         service.cvm_alive_master_ids_ = {service.master_id()};
         service.cvm_ring_revision_ = 10;
-        return service.ImportSlotMetadata(slot);
+        // No prefetched export and no shared commit batch: derive the previous
+        // owner and pull the export over inter-master RPC (the old one-arg
+        // call predates the prefetch/range parameters).
+        return service.ImportSlotMetadata(slot, nullptr, nullptr);
     }
 
     class AcceptVSegmentCommitter : public vsegment::VSegmentStateCommitter {
