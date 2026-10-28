@@ -18,6 +18,7 @@
 #include <chrono>
 #include <future>
 #include <limits>
+#include <map>
 #include <thread>
 
 namespace mooncake::vsegment {
@@ -166,12 +167,38 @@ class TestEndpointResolver : public SegmentEndpointResolver {
     ErrorCode ResolveLocation(const std::string& segment_id,
                               PSegmentLocation* location) override {
         ++resolves;
-        location->endpoint = "endpoint://" + segment_id;
+        if (fail_next) {
+            fail_next = false;
+            return ErrorCode::SEGMENT_NOT_FOUND;
+        }
+        location->endpoint =
+            empty_endpoint ? "" : "endpoint://" + segment_id;
         location->base_address = base_address;
         return ErrorCode::OK;
     }
     uint64_t base_address{4096};
     int resolves{0};
+    bool fail_next{false};
+    bool empty_endpoint{false};
+};
+
+// Serves several vsegment views from one planner, to prove the endpoint cache
+// is keyed by segment rather than by vsegment.
+class TestMultiViewProvider : public VSegmentViewProvider {
+   public:
+    ErrorCode LoadView(const std::string& partition_id,
+                       const std::string& vsegment_id, VSegmentView* output,
+                       std::string*) override {
+        ++loads;
+        auto found = views.find(vsegment_id);
+        if (found == views.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+        if (found->second.partition_id != partition_id)
+            return ErrorCode::SEGMENT_NOT_FOUND;
+        *output = found->second;
+        return ErrorCode::OK;
+    }
+    std::map<std::string, VSegmentView> views;
+    int loads{0};
 };
 
 std::shared_ptr<TestStateCommitter> Committer() {
@@ -594,6 +621,78 @@ TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
     // A second identical Plan hits SegmentLocationCache: no new resolver calls.
     auto again = planner.Plan(replica, {{1000, 512}});
     ASSERT_TRUE(again) << again.detail;
+    EXPECT_EQ(endpoints.resolves, 2);
+}
+
+TEST(VSegmentTransferPlannerTest, DoesNotCacheFailedResolve) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    endpoints.fail_next = true;
+    VSegmentViewCache cache;
+    SegmentLocationCache locations;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache,
+                                     &locations);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 0, 512};
+
+    EXPECT_EQ(planner.Plan(replica, {{1000, 512}}).error,
+              ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(endpoints.resolves, 1);
+
+    // A failed resolution must not be cached: the retry hits the master again
+    // for both members.
+    ASSERT_TRUE(planner.Plan(replica, {{1000, 512}}));
+    EXPECT_EQ(endpoints.resolves, 3);
+}
+
+TEST(VSegmentTransferPlannerTest, DoesNotCacheEmptyEndpoint) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    endpoints.empty_endpoint = true;
+    VSegmentViewCache cache;
+    SegmentLocationCache locations;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache,
+                                     &locations);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 0, 512};
+
+    EXPECT_EQ(planner.Plan(replica, {{1000, 512}}).error,
+              ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(locations.Size(), 0u);
+
+    endpoints.empty_endpoint = false;
+    ASSERT_TRUE(planner.Plan(replica, {{1000, 512}}));
+    EXPECT_EQ(endpoints.resolves, 3);
+}
+
+TEST(VSegmentTransferPlannerTest, CachesEndpointsAcrossVSegments) {
+    // Two vsegments striped over the same two psegments: the view cache misses
+    // for the second vsegment, but the endpoint cache does not.
+    PartitionQuotaAllocator allocator(Config());
+    auto first_allocation = allocator.Allocate("vs-1", Profile());
+    auto second_allocation = allocator.Allocate("vs-2", Profile());
+    ASSERT_TRUE(first_allocation);
+    ASSERT_TRUE(second_allocation);
+    TestMultiViewProvider provider;
+    provider.views["vs-1"] = first_allocation.view;
+    provider.views["vs-2"] = second_allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    SegmentLocationCache locations;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache,
+                                     &locations);
+
+    ASSERT_TRUE(planner.Plan({"partition-1", "vs-1", 0, 256}, {{1000, 256}}));
+    EXPECT_EQ(endpoints.resolves, 2);
+
+    ASSERT_TRUE(planner.Plan({"partition-1", "vs-2", 0, 256}, {{1000, 256}}));
+    EXPECT_EQ(provider.loads, 2);
     EXPECT_EQ(endpoints.resolves, 2);
 }
 
