@@ -11,17 +11,28 @@ namespace mooncake::vsegment {
 
 namespace {
 
+bool EnvFlagEnabled(const char* name, bool default_value) {
+    // Re-read per call (not cached) so the rollback drill and unit tests can
+    // toggle it on a running process.
+    const char* env = std::getenv(name);
+    if (env == nullptr) return default_value;
+    const std::string value(env);
+    return !(value == "0" || value == "false" || value == "no" ||
+             value == "off");
+}
+
+// The same kill switch as the master's table builder. Setting
+// MC_VSEGMENT_INLINE_LAYOUT=0 makes clients ignore any table they receive, so
+// the flag turns the feature off on both ends.
+bool VSegmentInlineLayoutEnabled() {
+    return EnvFlagEnabled("MC_VSEGMENT_INLINE_LAYOUT", /*default_value=*/true);
+}
+
 // Shadow mode: always resolve through the legacy view cache + endpoint RPC,
 // but compare the result against the inline table. Used by the rollback drill
 // to prove the inline data matches the old path before switching reads.
 bool VSegmentLayoutShadowEnabled() {
-    // Re-read per call (not cached) so the rollback drill and unit tests can
-    // toggle it on a running process.
-    const char* env = std::getenv("MC_VSEGMENT_LAYOUT_SHADOW");
-    if (env == nullptr) return false;
-    const std::string value(env);
-    return !(value == "0" || value == "false" || value == "no" ||
-             value == "off");
+    return EnvFlagEnabled("MC_VSEGMENT_LAYOUT_SHADOW", /*default_value=*/false);
 }
 
 std::string ViewCacheKey(const std::string& partition_id,
@@ -120,6 +131,11 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
         plan.error = ErrorCode::INVALID_PARAMS;
         plan.detail = "invalid vsegment transfer planner input";
         return plan;
+    }
+    if (layouts != nullptr && !VSegmentInlineLayoutEnabled()) {
+        // Kill switch: ignore the table on the client side too, so
+        // MC_VSEGMENT_INLINE_LAYOUT=0 restores the legacy path end to end.
+        layouts = nullptr;
     }
     VSegmentView view;
     VSegmentView candidate;

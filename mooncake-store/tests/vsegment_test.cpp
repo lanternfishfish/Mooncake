@@ -866,6 +866,31 @@ TEST(VSegmentTransferPlannerTest, ShadowModeStillResolvesLegacyPath) {
     EXPECT_EQ(plan.requests[0].transfer.physical_offset, 4096 + 48);
 }
 
+TEST(VSegmentTransferPlannerTest, FeatureFlagDisablesClientConsumption) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    std::vector<VSegmentLayoutEntry> layouts{
+        MakeLayoutEntryFromView(allocation.view, 0x200000)};
+
+    ASSERT_EQ(setenv("MC_VSEGMENT_INLINE_LAYOUT", "0", 1), 0);
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    unsetenv("MC_VSEGMENT_INLINE_LAYOUT");
+
+    ASSERT_TRUE(plan) << plan.detail;
+    // The kill switch must ignore the table on the client: legacy RPCs run and
+    // the legacy endpoints are used, even though the table is valid.
+    EXPECT_EQ(provider.loads, 1);
+    EXPECT_EQ(endpoints.resolves, 2);
+    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
+}
+
 TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutHasNoMatchingVSegment) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
