@@ -321,6 +321,7 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
             MasterMetricManager::instance()
                 .inc_get_replica_list_by_regex_failures();
         });
+    return response;
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
@@ -2122,7 +2123,7 @@ WrappedMasterService::InterMasterGetReplicaList(const std::string& key,
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+BatchGetReplicaListResponse
 WrappedMasterService::InterMasterBatchGetReplicaList(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "InterMasterBatchGetReplicaList");
