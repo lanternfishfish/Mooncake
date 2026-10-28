@@ -168,6 +168,60 @@ TEST(VSegmentLayoutWireTest, OldPutStartDecodesWithoutLayout) {
     EXPECT_FALSE(decoded.vsegment_layouts.has_value());
 }
 
+struct LegacyCopyStartResponse {
+    Replica::Descriptor source;
+    std::vector<Replica::Descriptor> targets;
+};
+YLT_REFL(LegacyCopyStartResponse, source, targets);
+
+struct LegacyMoveStartResponse {
+    Replica::Descriptor source;
+    std::optional<Replica::Descriptor> target;
+};
+YLT_REFL(LegacyMoveStartResponse, source, target);
+
+TEST(VSegmentLayoutWireTest, CopyStartRoundTripKeepsLayoutTable) {
+    CopyStartResponse response;
+    response.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(response);
+    CopyStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_TRUE(decoded.vsegment_layouts.has_value());
+    ASSERT_EQ(decoded.vsegment_layouts->size(), 1u);
+    EXPECT_EQ((*decoded.vsegment_layouts)[0].vsegment_id, "vs-1");
+}
+
+TEST(VSegmentLayoutWireTest, LegacyCopyStartDecodesWithoutLayoutTable) {
+    LegacyCopyStartResponse legacy;
+    const auto bytes = struct_pack::serialize(legacy);
+    CopyStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+TEST(VSegmentLayoutWireTest, NewCopyStartIsReadableByLegacyReader) {
+    CopyStartResponse response;
+    response.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(response);
+    LegacyCopyStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_TRUE(decoded.targets.empty());
+}
+
+TEST(VSegmentLayoutWireTest, LegacyMoveStartDecodesWithoutLayoutTable) {
+    LegacyMoveStartResponse legacy;
+    const auto bytes = struct_pack::serialize(legacy);
+    MoveStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
 TEST(VSegmentLayoutWireTest, BatchVectorRoundTripKeepsDedupTable) {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> batch;
     GetReplicaListResponse first;
