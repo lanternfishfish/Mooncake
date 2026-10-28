@@ -973,6 +973,10 @@ class Client {
      */
     void ReportFailedEndpointsToMasters(
         const std::set<std::string>& failed_endpoints);
+    // Drops cached psegment locations for `endpoints`. Called as soon as a
+    // vsegment transfer fails (read or write), so the next attempt re-resolves
+    // through the master instead of reusing a stale address.
+    void EvictVSegmentEndpoints(const std::vector<std::string>& endpoints);
 
     // Client identification
     const UUID client_id_;

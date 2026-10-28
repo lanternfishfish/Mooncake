@@ -2235,6 +2235,24 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
+// Drops cached psegment locations that served a failed vsegment transfer, so
+// the next attempt re-resolves through the master instead of reusing a stale
+// address.
+void Client::EvictVSegmentEndpoints(
+    const std::vector<std::string>& endpoints) {
+    if (!vsegment_endpoint_cache_ || endpoints.empty()) {
+        return;
+    }
+    // Sub-requests repeat the same endpoint per stripe; scan the cache once per
+    // distinct value.
+    std::unordered_set<std::string> seen;
+    seen.reserve(endpoints.size());
+    for (const auto& endpoint : endpoints) {
+        if (endpoint.empty() || !seen.insert(endpoint).second) continue;
+        vsegment_endpoint_cache_->EraseByEndpoint(endpoint);
+    }
+}
+
 // 方案二被动层：向 master 上报传输失败副本的坏端点（多 submaster 下内存段
 // 全量挂载于所有 submaster，坏端点影响所有 master 的分配，需广播）。
 // best-effort：上报失败仅告警不阻塞主流程，误报由 worker 重挂载时
@@ -5141,6 +5159,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
+        EvictVSegmentEndpoints(vsegment_plan_endpoints);
         if (failed_endpoints) {
             for (const auto& endpoint : vsegment_plan_endpoints) {
                 failed_endpoints->insert(endpoint);
@@ -5154,9 +5173,12 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 
     if (is_read) pt_wait.Start();
     const ErrorCode transfer_result = future->get();
-    if (transfer_result != ErrorCode::OK && failed_endpoints) {
-        for (const auto& endpoint : vsegment_plan_endpoints) {
-            failed_endpoints->insert(endpoint);
+    if (transfer_result != ErrorCode::OK) {
+        EvictVSegmentEndpoints(vsegment_plan_endpoints);
+        if (failed_endpoints) {
+            for (const auto& endpoint : vsegment_plan_endpoints) {
+                failed_endpoints->insert(endpoint);
+            }
         }
     }
     if (is_read) {
@@ -5197,9 +5219,22 @@ ErrorCode Client::TransferReadInternal(
         replica.length = length;
         auto plan = vsegment_transfer_planner_->Plan(replica, client_slices);
         if (!plan) return plan.error;
+        std::vector<std::string> plan_endpoints;
+        plan_endpoints.reserve(plan.requests.size());
+        for (const auto& subrequest : plan.requests) {
+            plan_endpoints.push_back(subrequest.endpoint);
+        }
         auto future = transfer_submitter_->submitVSegment(
             plan, TransferRequest::READ);
-        return future ? future->get() : ErrorCode::TRANSFER_FAIL;
+        if (!future) {
+            EvictVSegmentEndpoints(plan_endpoints);
+            return ErrorCode::TRANSFER_FAIL;
+        }
+        const ErrorCode read_result = future->get();
+        if (read_result != ErrorCode::OK) {
+            EvictVSegmentEndpoints(plan_endpoints);
+        }
+        return read_result;
     }
 
     auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
