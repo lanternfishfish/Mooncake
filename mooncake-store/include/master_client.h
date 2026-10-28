@@ -281,7 +281,9 @@ class MasterClient {
      * @return An expected object containing a map from object keys to their
      * replica descriptors on success, or an ErrorCode on failure.
      */
-    [[nodiscard]] tl::expected<GetReplicaListByRegexResponse, ErrorCode>
+    [[nodiscard]] tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
     GetReplicaListByRegex(const std::string& str);
 
     /**
@@ -290,11 +292,11 @@ class MasterClient {
      * @param object_infos Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] BatchGetReplicaListResponse BatchGetReplicaList(
-        const std::vector<std::string>& object_keys);
-    [[nodiscard]] BatchGetReplicaListResponse BatchGetReplicaList(
-        const std::vector<std::string>& object_keys,
-        const std::string& tenant_id);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& object_keys);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& object_keys,
+                        const std::string& tenant_id);
 
     /**
      * @brief Starts a put operation
@@ -316,10 +318,11 @@ class MasterClient {
      * @param config Replication configuration
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] BatchPutStartResponse BatchPutStart(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<uint64_t>>& slice_lengths,
-        const ReplicateConfig& config);
+    [[nodiscard]] std::vector<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const std::vector<std::string>& keys,
+                  const std::vector<std::vector<uint64_t>>& slice_lengths,
+                  const ReplicateConfig& config);
 
     /**
      * @brief Ends a put operation
@@ -370,10 +373,11 @@ class MasterClient {
         const std::string& key, const std::vector<size_t>& slice_lengths,
         const ReplicateConfig& config);
 
-    [[nodiscard]] BatchUpsertStartResponse BatchUpsertStart(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<uint64_t>>& slice_lengths,
-        const ReplicateConfig& config);
+    [[nodiscard]] std::vector<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const std::vector<std::string>& keys,
+                     const std::vector<std::vector<uint64_t>>& slice_lengths,
+                     const ReplicateConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
         const ObjectMeta& object_meta, ReplicaType replica_type,
@@ -979,12 +983,6 @@ class MasterClient {
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
-
-    // Envelope variant: the master returns a batch envelope (per-key results
-    // plus the deduplicated vsegment layout table) instead of a bare vector.
-    template <auto ServiceMethod, typename ResponseType, typename... Args>
-    [[nodiscard]] ResponseType invoke_batch_rpc_envelope(size_t input_size,
-                                                         Args&&... args);
 
     void WarmupRpcPool();
 

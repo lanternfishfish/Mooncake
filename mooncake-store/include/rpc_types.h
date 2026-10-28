@@ -110,39 +110,34 @@ struct PutStartResult {
 };
 YLT_REFL(PutStartResult, operation_id, replicas, vsegment_layouts);
 
-// Batch envelopes: the per-key results stay unchanged; the layout table is
-// deduplicated across the whole batch.
-struct BatchGetReplicaListResponse {
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
-    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
-        vsegment_layouts;
-};
-YLT_REFL(BatchGetReplicaListResponse, results, vsegment_layouts);
+// NOTE: a batch-level envelope struct (results + compatible table) is NOT wire
+// compatible with the legacy bare vector. struct_pack validates the 4-byte type
+// code on deserialize (ylt/struct_pack/unpacker.hpp deserialize_metainfo), and
+// `compatible` fields do not participate in that code, so a different top-level
+// type is rejected in both directions. The deduplicated batch table therefore
+// rides on the first successful per-key GetReplicaListResponse, whose
+// compatible field keeps the old wire type intact.
 
-struct BatchPutStartResponse {
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
-    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
-        vsegment_layouts;
-};
-YLT_REFL(BatchPutStartResponse, results, vsegment_layouts);
+// Attaches the deduplicated batch table to the first successful per-key
+// response. No-op when there is no table or no successful key.
+inline void AttachVSegmentLayoutTableToFirstSuccess(
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry> layouts) {
+    if (layouts.empty()) return;
+    for (auto& result : results) {
+        if (result) {
+            result->vsegment_layouts = std::move(layouts);
+            return;
+        }
+    }
+}
 
-struct BatchUpsertStartResponse {
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
-    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
-        vsegment_layouts;
-};
-YLT_REFL(BatchUpsertStartResponse, results, vsegment_layouts);
-
-// Regex lookup returns descriptors per matched key; the envelope adds the
-// deduplicated layout table for the vsegment replicas in those lists.
-struct GetReplicaListByRegexResponse {
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>> results;
-    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
-        vsegment_layouts;
-};
-YLT_REFL(GetReplicaListByRegexResponse, results, vsegment_layouts);
+// Collects layout tables carried by any per-key response of a batch (new
+// masters put one deduplicated table on the first successful key; legacy
+// masters carry none). Deduplicated by vsegment_id.
+inline void MergeVSegmentLayoutTablesFromResults(
+    const std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry>& target);
 
 // Appends `incoming` to `target`, keeping the first entry per vsegment_id.
 // Used to merge tables built by different masters (route groups) into the
@@ -159,6 +154,16 @@ inline void MergeVSegmentLayoutTable(
     for (const auto& entry : incoming) {
         if (seen.insert(entry.vsegment_id).second) {
             target.push_back(entry);
+        }
+    }
+}
+
+inline void MergeVSegmentLayoutTablesFromResults(
+    const std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry>& target) {
+    for (const auto& result : results) {
+        if (result && result->vsegment_layouts.has_value()) {
+            MergeVSegmentLayoutTable(target, *result->vsegment_layouts);
         }
     }
 }

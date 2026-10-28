@@ -167,20 +167,23 @@ TEST(VSegmentLayoutWireTest, OldPutStartDecodesWithoutLayout) {
     EXPECT_FALSE(decoded.vsegment_layouts.has_value());
 }
 
-TEST(VSegmentLayoutWireTest, BatchResponseRoundTripKeepsDedupTable) {
-    BatchGetReplicaListResponse batch;
-    batch.results.push_back(GetReplicaListResponse{});
-    batch.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+TEST(VSegmentLayoutWireTest, BatchVectorRoundTripKeepsDedupTable) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> batch;
+    GetReplicaListResponse first;
+    first.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
         MakeTestLayoutEntry()};
+    batch.push_back(std::move(first));
+    batch.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
     const auto bytes = struct_pack::serialize(batch);
-    BatchGetReplicaListResponse decoded;
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> decoded;
     ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
               struct_pack::errc::ok);
-    ASSERT_TRUE(decoded.vsegment_layouts.has_value());
-    ASSERT_EQ(decoded.vsegment_layouts->size(), 1u);
-    EXPECT_EQ(decoded.vsegment_layouts->front().vsegment_id, "vs-1");
-    ASSERT_EQ(decoded.vsegment_layouts->front().members.size(), 1u);
-    EXPECT_EQ(decoded.vsegment_layouts->front().members.front().endpoint,
+    ASSERT_EQ(decoded.size(), 2u);
+    ASSERT_TRUE(decoded[0]->vsegment_layouts.has_value());
+    ASSERT_EQ(decoded[0]->vsegment_layouts->size(), 1u);
+    EXPECT_EQ(decoded[0]->vsegment_layouts->front().vsegment_id, "vs-1");
+    ASSERT_EQ(decoded[0]->vsegment_layouts->front().members.size(), 1u);
+    EXPECT_EQ(decoded[0]->vsegment_layouts->front().members.front().endpoint,
               "127.0.0.1:19000");
 }
 
@@ -201,100 +204,54 @@ TEST(VSegmentLayoutWireTest, CachedQueryResultMapRoundTripKeepsLayout) {
               "vs-1");
 }
 
-TEST(VSegmentLayoutWireTest, BatchEnvelopeIsReadableByLegacyVectorReader) {
-    BatchGetReplicaListResponse batch;
-    batch.results.push_back(GetReplicaListResponse{});
-    batch.results.push_back(
-        tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
-    batch.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
-        MakeTestLayoutEntry()};
-    const auto bytes = struct_pack::serialize(batch);
+// Batch RPCs keep their legacy wire type (vector<expected<...>>); the
+// deduplicated table rides on the first successful per-key response. This is
+// the same GetReplicaListResponse type, so old readers simply ignore the
+// compatible field. A separate batch envelope type would change the struct_pack
+// type code and break mixed-version decoding in both directions.
+TEST(VSegmentLayoutWireTest, BatchVectorCarriesTableOnFirstResponse) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> batch;
+    batch.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    batch.push_back(GetReplicaListResponse{});
+    batch.push_back(GetReplicaListResponse{});
+    AttachVSegmentLayoutTableToFirstSuccess(
+        batch, {MakeTestLayoutEntry()});
+    ASSERT_TRUE(batch[0]);
+    EXPECT_FALSE(batch[0]->vsegment_layouts.has_value());
+    ASSERT_TRUE(batch[1]->vsegment_layouts.has_value());
+    EXPECT_FALSE(batch[2]->vsegment_layouts.has_value());
 
+    // Same wire type round-trip keeps the table on the same element.
+    const auto bytes = struct_pack::serialize(batch);
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> decoded;
     ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
               struct_pack::errc::ok);
-    ASSERT_EQ(decoded.size(), 2u);
-    EXPECT_TRUE(decoded[0].has_value());
-    ASSERT_FALSE(decoded[1].has_value());
-    EXPECT_EQ(decoded[1].error(), ErrorCode::OBJECT_NOT_FOUND);
-}
+    ASSERT_EQ(decoded.size(), 3u);
+    ASSERT_TRUE(decoded[1]->vsegment_layouts.has_value());
+    EXPECT_EQ(decoded[1]->vsegment_layouts->front().vsegment_id, "vs-1");
 
-TEST(VSegmentLayoutWireTest, LegacyBatchVectorDecodesAsEnvelope) {
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> legacy;
-    legacy.push_back(GetReplicaListResponse{});
-    legacy.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
-    const auto bytes = struct_pack::serialize(legacy);
-
-    BatchGetReplicaListResponse decoded;
-    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
-              struct_pack::errc::ok);
-    ASSERT_EQ(decoded.results.size(), 2u);
-    EXPECT_TRUE(decoded.results[0].has_value());
-    EXPECT_FALSE(decoded.results[1].has_value());
-    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
-}
-
-TEST(VSegmentLayoutWireTest, BatchPutStartEnvelopeBothDirections) {
-    BatchPutStartResponse batch;
-    batch.results.push_back(std::vector<Replica::Descriptor>{});
-    batch.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
-        MakeTestLayoutEntry()};
-    const auto bytes = struct_pack::serialize(batch);
-
-    // New writer -> legacy reader (bare vector).
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        legacy;
-    ASSERT_EQ(struct_pack::deserialize_to(legacy, bytes),
-              struct_pack::errc::ok);
-    ASSERT_EQ(legacy.size(), 1u);
-    EXPECT_TRUE(legacy[0].has_value());
-
-    // Legacy writer -> new reader.
-    const auto legacy_bytes = struct_pack::serialize(legacy);
-    BatchPutStartResponse decoded;
-    ASSERT_EQ(struct_pack::deserialize_to(decoded, legacy_bytes),
-              struct_pack::errc::ok);
-    ASSERT_EQ(decoded.results.size(), 1u);
-    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
-}
-
-TEST(VSegmentLayoutWireTest, BatchUpsertEnvelopeRoundTripKeepsDedupTable) {
-    BatchUpsertStartResponse batch;
-    batch.results.push_back(
-        tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
-    batch.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
-        MakeTestLayoutEntry()};
-    const auto bytes = struct_pack::serialize(batch);
-
-    BatchUpsertStartResponse decoded;
-    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
-              struct_pack::errc::ok);
-    ASSERT_EQ(decoded.results.size(), 1u);
-    ASSERT_FALSE(decoded.results[0].has_value());
-    ASSERT_TRUE(decoded.vsegment_layouts.has_value());
-    EXPECT_EQ(decoded.vsegment_layouts->front().vsegment_id, "vs-1");
-}
-
-TEST(VSegmentLayoutWireTest, RegexEnvelopeBothDirections) {
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>> legacy;
-    legacy.emplace("key-1", std::vector<Replica::Descriptor>{});
-    const auto legacy_bytes = struct_pack::serialize(legacy);
-
-    GetReplicaListByRegexResponse decoded;
-    ASSERT_EQ(struct_pack::deserialize_to(decoded, legacy_bytes),
-              struct_pack::errc::ok);
-    ASSERT_EQ(decoded.results.size(), 1u);
-    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
-
-    decoded.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
-        MakeTestLayoutEntry()};
-    const auto bytes = struct_pack::serialize(decoded);
-
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>
+    // And the legacy reader (struct without the compatible field) still works.
+    std::vector<tl::expected<LegacyGetReplicaListResponse, ErrorCode>>
         legacy_reader;
     ASSERT_EQ(struct_pack::deserialize_to(legacy_reader, bytes),
               struct_pack::errc::ok);
-    ASSERT_EQ(legacy_reader.size(), 1u);
+    ASSERT_EQ(legacy_reader.size(), 3u);
+    EXPECT_TRUE(legacy_reader[1].has_value());
+}
+
+TEST(VSegmentLayoutWireTest, CollectsTablesFromBatchResults) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> batch;
+    batch.push_back(GetReplicaListResponse{});
+    auto second = MakeTestLayoutEntry();
+    second.vsegment_id = "vs-2";
+    GetReplicaListResponse with_table;
+    with_table.vsegment_layouts = std::vector<VSegmentLayoutEntry>{second};
+    batch.push_back(std::move(with_table));
+
+    std::vector<VSegmentLayoutEntry> merged;
+    MergeVSegmentLayoutTablesFromResults(batch, merged);
+    ASSERT_EQ(merged.size(), 1u);
+    EXPECT_EQ(merged.front().vsegment_id, "vs-2");
 }
 
 TEST(VSegmentLayoutWireTest, MergeVSegmentLayoutTableDeduplicates) {
@@ -2292,12 +2249,12 @@ TEST(VSegmentLayoutMasterTest, BatchAndSingleResponsesCarryResolvedLayouts) {
     ASSERT_TRUE(master.PutEnd(client, object, tenant, ReplicaType::MEMORY,
                               (**started).operation_id));
 
-    // Batch envelope: the deduplicated table is attached at the wrapper.
-    auto batch = master.BatchGetReplicaListWithLayouts({key}, tenant);
-    ASSERT_EQ(batch.results.size(), 1u);
-    ASSERT_TRUE(batch.results[0].has_value());
-    ASSERT_TRUE(batch.vsegment_layouts.has_value());
-    const auto& entry = batch.vsegment_layouts->front();
+    // Batch: the deduplicated table rides on the first successful response.
+    auto batch = master.BatchGetReplicaList({key}, tenant);
+    ASSERT_EQ(batch.size(), 1u);
+    ASSERT_TRUE(batch[0].has_value());
+    ASSERT_TRUE(batch[0]->vsegment_layouts.has_value());
+    const auto& entry = batch[0]->vsegment_layouts->front();
     EXPECT_EQ(entry.vsegment_id, vsegment_id);
     EXPECT_EQ(entry.partition_id, partition_id);
     ASSERT_EQ(entry.members.size(), 2u);
@@ -2306,16 +2263,13 @@ TEST(VSegmentLayoutMasterTest, BatchAndSingleResponsesCarryResolvedLayouts) {
     EXPECT_EQ(entry.members[1].endpoint, "10.0.0.2:12345");
     EXPECT_EQ(entry.members[1].base_address, 0x500000u);
 
-    // Cache: a second call returns the same single entry (no duplicate).
-    auto cached = master.BatchGetReplicaListWithLayouts({key, key}, tenant);
-    ASSERT_TRUE(cached.vsegment_layouts.has_value());
-    EXPECT_EQ(cached.vsegment_layouts->size(), 1u);
-
-    // The vector-only API keeps working but does not attach tables.
-    auto legacy = master.BatchGetReplicaList({key}, tenant);
-    ASSERT_EQ(legacy.size(), 1u);
-    EXPECT_TRUE(legacy[0].has_value());
-    EXPECT_FALSE(legacy[0]->vsegment_layouts.has_value());
+    // Cache: a second call returns the same single entry (no duplicate), and
+    // only the first successful key carries it.
+    auto cached = master.BatchGetReplicaList({key, key}, tenant);
+    ASSERT_EQ(cached.size(), 2u);
+    ASSERT_TRUE(cached[0]->vsegment_layouts.has_value());
+    EXPECT_EQ(cached[0]->vsegment_layouts->size(), 1u);
+    EXPECT_FALSE(cached[1]->vsegment_layouts.has_value());
 
     // Single read also carries the table.
     auto loaded = master.GetReplicaList(key, tenant);

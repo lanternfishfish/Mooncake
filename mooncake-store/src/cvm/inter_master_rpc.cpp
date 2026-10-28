@@ -206,25 +206,24 @@ InterMasterRpcClient::GetReplicaList(const std::string& master_id,
                       GetReplicaListResponse>(*address, key, tenant_id);
 }
 
-BatchGetReplicaListResponse InterMasterRpcClient::BatchGetReplicaList(
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+InterMasterRpcClient::BatchGetReplicaList(
     const std::string& master_id, const std::vector<std::string>& keys,
     const std::string& tenant_id) {
     auto address = ResolveAddress(master_id);
     if (!address) {
-        BatchGetReplicaListResponse response;
-        response.results.assign(
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> errs(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-        return response;
+        return errs;
     }
-    // RPC 返回值本身已是逐 key 的 expected 向量 + 去重表；外层只关心传输层失败。
+    // RPC 返回值本身已是逐 key 的 expected 向量；外层只关心传输层失败。
     auto result = invoke_rpc<
         &WrappedMasterService::InterMasterBatchGetReplicaList,
-        BatchGetReplicaListResponse>(*address, keys, tenant_id);
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(
+        *address, keys, tenant_id);
     if (!result.has_value()) {
-        BatchGetReplicaListResponse response;
-        response.results.assign(
+        return std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>(
             keys.size(), tl::make_unexpected(result.error()));
-        return response;
     }
     return std::move(result.value());
 }

@@ -1861,7 +1861,7 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
                                  FindGroupIdOnDifferentShard(keys[2])};
 
     auto results =
-        service_.BatchPutStart(client_id, keys, sizes, config).results;
+        service_.BatchPutStart(client_id, keys, sizes, config);
     ASSERT_EQ(results.size(), keys.size());
     for (const auto& result : results) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
@@ -1882,7 +1882,7 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     ReplicateConfig invalid_config = config;
     invalid_config.group_ids = std::vector<std::string>{"only_one"};
     auto invalid_group_results =
-        service_.BatchPutStart(client_id, keys, sizes, invalid_config).results;
+        service_.BatchPutStart(client_id, keys, sizes, invalid_config);
     ASSERT_EQ(invalid_group_results.size(), keys.size());
     for (const auto& result : invalid_group_results) {
         ASSERT_FALSE(result.has_value());
@@ -1890,7 +1890,7 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     }
 
     auto invalid_size_results =
-        service_.BatchPutStart(client_id, keys, {1024}, config).results;
+        service_.BatchPutStart(client_id, keys, {1024}, config);
     ASSERT_EQ(invalid_size_results.size(), keys.size());
     for (const auto& result : invalid_size_results) {
         ASSERT_FALSE(result.has_value());
@@ -5396,10 +5396,8 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     std::vector<std::string> tenant_keys = {tenant_key_a, tenant_key_b};
     std::vector<uint64_t> tenant_sizes = {1024, 2048};
     auto tenant_put_start =
-        service_
-            .BatchPutStart(client_id, tenant_keys, tenant_sizes, config,
-                           tenant_id.value())
-            .results;
+        service_.BatchPutStart(client_id, tenant_keys, tenant_sizes, config,
+                               tenant_id.value());
     ASSERT_EQ(tenant_put_start.size(), tenant_keys.size());
     for (const auto& result : tenant_put_start) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());

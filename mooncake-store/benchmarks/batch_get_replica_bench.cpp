@@ -230,8 +230,7 @@ WriteStats PutCompletedBatch(mooncake::MasterClient& client,
     WriteStats stats;
     const mooncake::ReplicateConfig config;
     auto put_start_result =
-        client.BatchPutStart(keys, MakeSliceLengths(keys.size()), config)
-            .results;
+        client.BatchPutStart(keys, MakeSliceLengths(keys.size()), config);
 
     std::vector<std::string> started_keys;
     started_keys.reserve(keys.size());
@@ -394,7 +393,7 @@ ThreadStats RunLookupWorker(uint64_t thread_idx,
         }
 
         const auto started_at = std::chrono::steady_clock::now();
-        auto results = client.BatchGetReplicaList(keys).results;
+        auto results = client.BatchGetReplicaList(keys);
         const auto finished_at = std::chrono::steady_clock::now();
         const double latency_ms =
             std::chrono::duration<double, std::milli>(finished_at - started_at)

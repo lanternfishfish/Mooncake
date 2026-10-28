@@ -123,10 +123,12 @@ class InterMasterRpcClient {
         const std::string& tenant_id);
 
     // Forwards a batch GetReplicaList to the slot-owning submaster. The
-    // envelope carries the vsegment layout table the owner resolved.
-    BatchGetReplicaListResponse BatchGetReplicaList(
-        const std::string& master_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id);
+    // owner-built vsegment layout table rides on the first successful
+    // per-key response (no batch envelope: that would change the wire type).
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::string& master_id,
+                        const std::vector<std::string>& keys,
+                        const std::string& tenant_id);
 
     // ----- Write forwarding (model B) -----
 

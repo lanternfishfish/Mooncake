@@ -619,72 +619,6 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         }());
 }
 
-// Envelope variant of invoke_batch_rpc: the master returns a batch envelope
-// (per-key results + deduplicated vsegment layout table) instead of a bare
-// vector. Transport failures still degrade to per-key errors.
-template <auto ServiceMethod, typename ResponseType, typename... Args>
-ResponseType MasterClient::invoke_batch_rpc_envelope(size_t input_size,
-                                                     Args&&... args) {
-    auto pool = client_accessor_.GetClientPool();
-
-    if (metrics_) {
-        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
-    }
-
-    auto start_time = std::chrono::steady_clock::now();
-    return async_simple::coro::syncAwait(
-        [&]() -> async_simple::coro::Lazy<ResponseType> {
-            SpDiag::PerfPoint pt_send(PerfKey::CVM_RPC_BATCH_SEND,
-                                      SpDiag::PerfLevel::MODULE);
-            pt_send.Start();
-            auto ret = co_await pool->send_request(
-                [&](coro_io::client_reuse_hint,
-                    coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
-                });
-            pt_send.End(ret.has_value() ? 0 : -1);
-            if (!ret.has_value()) {
-                LOG(ERROR) << "Client not available";
-                ResponseType response;
-                response.results.reserve(input_size);
-                for (size_t i = 0; i < input_size; ++i) {
-                    response.results.emplace_back(
-                        tl::make_unexpected(ErrorCode::RPC_FAIL));
-                }
-                co_return response;
-            }
-            SpDiag::PerfPoint pt_result(PerfKey::CVM_RPC_BATCH_RESULT_GET,
-                                        SpDiag::PerfLevel::MODULE);
-            pt_result.Start();
-            auto result = co_await std::move(ret.value());
-            pt_result.End(result ? 0 : -1);
-            if (!result) {
-                const ErrorCode err_code =
-                    (result.error().code == coro_rpc::errc::timed_out)
-                        ? ErrorCode::RPC_TIMEOUT
-                        : ErrorCode::RPC_FAIL;
-                LOG(ERROR) << "Batch RPC call failed: " << result.error().msg;
-                ResponseType response;
-                response.results.reserve(input_size);
-                for (size_t i = 0; i < input_size; ++i) {
-                    response.results.emplace_back(
-                        tl::make_unexpected(err_code));
-                }
-                co_return response;
-            }
-            if (metrics_) {
-                auto end_time = std::chrono::steady_clock::now();
-                auto latency =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        end_time - start_time);
-                metrics_->rpc_latency.observe(
-                    {RpcNameTraits<ServiceMethod>::value}, latency.count());
-            }
-            co_return result->result();
-        }());
-}
-
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
     RoutedCallTiming* timing, const std::string& tenant_id,
@@ -1283,14 +1217,16 @@ MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
     return result;
 }
 
-tl::expected<GetReplicaListByRegexResponse, ErrorCode>
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
 MasterClient::GetReplicaListByRegex(const std::string& str) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaListByRegex");
     timer.LogRequest("Regex=", str);
 
     auto result = invoke_rpc<
         &WrappedMasterService::GetReplicaListByRegex,
-        GetReplicaListByRegexResponse>(str, tenant_id_.value());
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(
+        str, tenant_id_.value());
 
     timer.LogResponseExpected(result);
     return result;
@@ -1448,13 +1384,14 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     return result;
 }
 
-BatchGetReplicaListResponse MasterClient::BatchGetReplicaList(
-    const std::vector<std::string>& object_keys) {
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     return BatchGetReplicaList(object_keys, tenant_id_.value());
 }
 
-BatchGetReplicaListResponse MasterClient::BatchGetReplicaList(
-    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
+                                  const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size(),
                      ", tenant_id=", tenant_id);
@@ -1462,20 +1399,18 @@ BatchGetReplicaListResponse MasterClient::BatchGetReplicaList(
     // Single-master mode (routing not loaded): use the original batch path.
     if (partition_router_.Size() == 0) {
         const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-        auto result = invoke_batch_rpc_envelope<
-            &WrappedMasterService::BatchGetReplicaList,
-            BatchGetReplicaListResponse>(object_keys.size(), object_keys,
-                                         tenant_id, trace_id, client_id_);
-        timer.LogResponse("result=", result.results.size(), " operations");
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
+                             GetReplicaListResponse>(
+                object_keys.size(), object_keys, tenant_id, trace_id,
+                client_id_);
+        timer.LogResponse("result=", result.size(), " operations");
         return result;
     }
 
-    BatchGetReplicaListResponse response;
-    response.results.assign(
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results(
         object_keys.size(),
         tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
-    auto& results = response.results;
-    std::vector<VSegmentLayoutEntry> layouts;
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     auto groups = GroupKeysBySubmaster(object_keys, tenant_id);
@@ -1493,16 +1428,12 @@ BatchGetReplicaListResponse MasterClient::BatchGetReplicaList(
             group_keys.push_back(object_keys[idx]);
         }
 
-        auto group_result = invoke_batch_rpc_envelope<
-            &WrappedMasterService::BatchGetReplicaList,
-            BatchGetReplicaListResponse>(group_keys.size(), group_keys,
-                                         tenant_id, trace_id, client_id_);
-        for (size_t j = 0;
-             j < indices.size() && j < group_result.results.size(); ++j) {
-            results[indices[j]] = std::move(group_result.results[j]);
-        }
-        if (group_result.vsegment_layouts.has_value()) {
-            MergeVSegmentLayoutTable(layouts, *group_result.vsegment_layouts);
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
+                             GetReplicaListResponse>(
+                group_keys.size(), group_keys, tenant_id, trace_id, client_id_);
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
         }
     }
 
@@ -1510,36 +1441,30 @@ BatchGetReplicaListResponse MasterClient::BatchGetReplicaList(
     // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
     RetryBatchOnStaleRoute<GetReplicaListResponse>(
         tenant_id, object_keys, results,
-        [this, &results, &layouts, tenant_id, trace_id](
+        [this, &results, tenant_id, trace_id](
             const std::string& submaster, std::vector<std::string> group_keys,
             const std::vector<size_t>& group_orig) {
             SwitchToSubmasterByAddress(submaster);
-            auto group_result = invoke_batch_rpc_envelope<
-                &WrappedMasterService::BatchGetReplicaList,
-                BatchGetReplicaListResponse>(group_keys.size(), group_keys,
-                                             tenant_id, trace_id, client_id_);
-            if (group_result.results.size() != group_orig.size()) {
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
+                                 GetReplicaListResponse>(
+                    group_keys.size(), group_keys, tenant_id, trace_id,
+                    client_id_);
+            if (group_result.size() != group_orig.size()) {
                 return false;
             }
             bool all_ok = true;
             for (size_t j = 0; j < group_orig.size(); ++j) {
-                results[group_orig[j]] = std::move(group_result.results[j]);
+                results[group_orig[j]] = std::move(group_result[j]);
                 if (!results[group_orig[j]]) {
                     all_ok = false;
                 }
             }
-            if (group_result.vsegment_layouts.has_value()) {
-                MergeVSegmentLayoutTable(layouts,
-                                         *group_result.vsegment_layouts);
-            }
             return all_ok;
         });
 
-    if (!layouts.empty()) {
-        response.vsegment_layouts = std::move(layouts);
-    }
     timer.LogResponse("result=", results.size(), " operations");
-    return response;
+    return results;
 }
 
 tl::expected<PutStartResult, ErrorCode>
@@ -1569,7 +1494,8 @@ MasterClient::PutStart(const std::string& key,
     return result;
 }
 
-BatchPutStartResponse MasterClient::BatchPutStart(
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterClient::BatchPutStart(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
@@ -1590,19 +1516,18 @@ BatchPutStartResponse MasterClient::BatchPutStart(
 
     // Single-master mode (routing not loaded): use the original batch path.
     if (partition_router_.Size() == 0) {
-        auto result = invoke_batch_rpc_envelope<
-            &WrappedMasterService::BatchPutStart, BatchPutStartResponse>(
-            keys.size(), client_id_, keys, total_slice_lengths, config,
-            tenant_id_.value(), trace_id);
-        timer.LogResponse("result=", result.results.size(), " operations");
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
+                             std::vector<Replica::Descriptor>>(
+                keys.size(), client_id_, keys, total_slice_lengths, config,
+                tenant_id_.value(), trace_id);
+        timer.LogResponse("result=", result.size(), " operations");
         return result;
     }
 
-    BatchPutStartResponse response;
-    response.results.assign(
-        keys.size(), tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
-    auto& results = response.results;
-    std::vector<VSegmentLayoutEntry> layouts;
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results(keys.size(),
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
 
     auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
     for (auto& [submaster, indices] : groups) {
@@ -1622,16 +1547,13 @@ BatchPutStartResponse MasterClient::BatchPutStart(
             group_total_slice_lengths.push_back(total_slice_lengths[idx]);
         }
 
-        auto group_result = invoke_batch_rpc_envelope<
-            &WrappedMasterService::BatchPutStart, BatchPutStartResponse>(
+        auto group_result = invoke_batch_rpc<
+            &WrappedMasterService::BatchPutStart,
+            std::vector<Replica::Descriptor>>(
             group_keys.size(), client_id_, group_keys,
             group_total_slice_lengths, config, tenant_id_.value(), trace_id);
-        for (size_t j = 0;
-             j < indices.size() && j < group_result.results.size(); ++j) {
-            results[indices[j]] = std::move(group_result.results[j]);
-        }
-        if (group_result.vsegment_layouts.has_value()) {
-            MergeVSegmentLayoutTable(layouts, *group_result.vsegment_layouts);
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
         }
     }
 
@@ -1640,7 +1562,7 @@ BatchPutStartResponse MasterClient::BatchPutStart(
     //（Client::StartBatchPut 收到后走 SetTerminalError，不再有下一轮）。
     RetryBatchOnStaleRoute<std::vector<Replica::Descriptor>>(
         tenant_id_.value(), keys, results,
-        [this, &results, &layouts, &config, &total_slice_lengths, trace_id](
+        [this, &results, &config, &total_slice_lengths, trace_id](
             const std::string& submaster, std::vector<std::string> group_keys,
             const std::vector<size_t>& group_orig) {
             SwitchToSubmasterByAddress(submaster);
@@ -1649,33 +1571,27 @@ BatchPutStartResponse MasterClient::BatchPutStart(
             for (size_t idx : group_orig) {
                 group_total_slice_lengths.push_back(total_slice_lengths[idx]);
             }
-            auto group_result = invoke_batch_rpc_envelope<
-                &WrappedMasterService::BatchPutStart, BatchPutStartResponse>(
+            auto group_result = invoke_batch_rpc<
+                &WrappedMasterService::BatchPutStart,
+                std::vector<Replica::Descriptor>>(
                 group_keys.size(), client_id_, group_keys,
                 group_total_slice_lengths, config, tenant_id_.value(),
                 trace_id);
-            if (group_result.results.size() != group_orig.size()) {
+            if (group_result.size() != group_orig.size()) {
                 return false;
             }
             bool all_ok = true;
             for (size_t j = 0; j < group_orig.size(); ++j) {
-                results[group_orig[j]] = std::move(group_result.results[j]);
+                results[group_orig[j]] = std::move(group_result[j]);
                 if (!results[group_orig[j]]) {
                     all_ok = false;
                 }
             }
-            if (group_result.vsegment_layouts.has_value()) {
-                MergeVSegmentLayoutTable(layouts,
-                                         *group_result.vsegment_layouts);
-            }
             return all_ok;
         });
 
-    if (!layouts.empty()) {
-        response.vsegment_layouts = std::move(layouts);
-    }
     timer.LogResponse("result=", results.size(), " operations");
-    return response;
+    return results;
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
@@ -1903,7 +1819,8 @@ MasterClient::UpsertStart(const std::string& key,
     return result;
 }
 
-BatchUpsertStartResponse MasterClient::BatchUpsertStart(
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterClient::BatchUpsertStart(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
@@ -1922,20 +1839,18 @@ BatchUpsertStartResponse MasterClient::BatchUpsertStart(
 
     // Single-master mode (routing not loaded): use the original batch path.
     if (partition_router_.Size() == 0) {
-        auto result = invoke_batch_rpc_envelope<
-            &WrappedMasterService::BatchUpsertStart,
-            BatchUpsertStartResponse>(keys.size(), client_id_, keys,
-                                      total_slice_lengths, config,
-                                      tenant_id_.value());
-        timer.LogResponse("result=", result.results.size(), " operations");
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
+                             std::vector<Replica::Descriptor>>(
+                keys.size(), client_id_, keys, total_slice_lengths, config,
+                tenant_id_.value());
+        timer.LogResponse("result=", result.size(), " operations");
         return result;
     }
 
-    BatchUpsertStartResponse response;
-    response.results.assign(
-        keys.size(), tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
-    auto& results = response.results;
-    std::vector<VSegmentLayoutEntry> layouts;
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results(keys.size(),
+                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
 
     auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
     for (auto& [submaster, indices] : groups) {
@@ -1955,17 +1870,13 @@ BatchUpsertStartResponse MasterClient::BatchUpsertStart(
             group_total_slice_lengths.push_back(total_slice_lengths[idx]);
         }
 
-        auto group_result = invoke_batch_rpc_envelope<
+        auto group_result = invoke_batch_rpc<
             &WrappedMasterService::BatchUpsertStart,
-            BatchUpsertStartResponse>(group_keys.size(), client_id_, group_keys,
-                                      group_total_slice_lengths, config,
-                                      tenant_id_.value());
-        for (size_t j = 0;
-             j < indices.size() && j < group_result.results.size(); ++j) {
-            results[indices[j]] = std::move(group_result.results[j]);
-        }
-        if (group_result.vsegment_layouts.has_value()) {
-            MergeVSegmentLayoutTable(layouts, *group_result.vsegment_layouts);
+            std::vector<Replica::Descriptor>>(
+            group_keys.size(), client_id_, group_keys,
+            group_total_slice_lengths, config, tenant_id_.value());
+        for (size_t j = 0; j < indices.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
         }
     }
 
@@ -1973,7 +1884,7 @@ BatchUpsertStartResponse MasterClient::BatchUpsertStart(
     // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
     RetryBatchOnStaleRoute<std::vector<Replica::Descriptor>>(
         tenant_id_.value(), keys, results,
-        [this, &results, &layouts, &total_slice_lengths, &config](
+        [this, &results, &total_slice_lengths, &config](
             const std::string& submaster, std::vector<std::string> group_keys,
             const std::vector<size_t>& group_orig) {
             SwitchToSubmasterByAddress(submaster);
@@ -1982,34 +1893,26 @@ BatchUpsertStartResponse MasterClient::BatchUpsertStart(
             for (size_t idx : group_orig) {
                 group_total_slice_lengths.push_back(total_slice_lengths[idx]);
             }
-            auto group_result = invoke_batch_rpc_envelope<
+            auto group_result = invoke_batch_rpc<
                 &WrappedMasterService::BatchUpsertStart,
-                BatchUpsertStartResponse>(group_keys.size(), client_id_,
-                                          group_keys,
-                                          group_total_slice_lengths, config,
-                                          tenant_id_.value());
-            if (group_result.results.size() != group_orig.size()) {
+                std::vector<Replica::Descriptor>>(
+                group_keys.size(), client_id_, group_keys,
+                group_total_slice_lengths, config, tenant_id_.value());
+            if (group_result.size() != group_orig.size()) {
                 return false;
             }
             bool all_ok = true;
             for (size_t j = 0; j < group_orig.size(); ++j) {
-                results[group_orig[j]] = std::move(group_result.results[j]);
+                results[group_orig[j]] = std::move(group_result[j]);
                 if (!results[group_orig[j]]) {
                     all_ok = false;
                 }
             }
-            if (group_result.vsegment_layouts.has_value()) {
-                MergeVSegmentLayoutTable(layouts,
-                                         *group_result.vsegment_layouts);
-            }
             return all_ok;
         });
 
-    if (!layouts.empty()) {
-        response.vsegment_layouts = std::move(layouts);
-    }
     timer.LogResponse("result=", results.size(), " operations");
-    return response;
+    return results;
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(

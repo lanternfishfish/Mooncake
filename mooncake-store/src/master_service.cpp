@@ -7579,17 +7579,16 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     return response;
 }
 
-BatchGetReplicaListResponse MasterService::BatchGetReplicaListWithLayouts(
-    const std::vector<std::string>& keys, const TenantId& tenant_id) {
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
+                                   const TenantId& tenant_id) {
     assert(tenant_id.IsValid());
 
-    BatchGetReplicaListResponse response;
-    response.results.assign(
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results(
         keys.size(), tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
     if (keys.empty()) {
-        return response;
+        return results;
     }
-    auto& results = response.results;
 
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
 
@@ -7637,8 +7636,8 @@ BatchGetReplicaListResponse MasterService::BatchGetReplicaListWithLayouts(
         }
     }
 
-#ifdef STORE_USE_ETCD
     std::vector<VSegmentLayoutEntry> layouts;
+#ifdef STORE_USE_ETCD
     for (const auto& [owner, indices] : forward_groups) {
         std::vector<std::string> group_keys;
         group_keys.reserve(indices.size());
@@ -7647,16 +7646,12 @@ BatchGetReplicaListResponse MasterService::BatchGetReplicaListWithLayouts(
         }
         auto group_result = inter_master_rpc_->BatchGetReplicaList(
             owner, group_keys, normalized_tenant.value());
-        for (size_t j = 0;
-             j < indices.size() && j < group_result.results.size(); ++j) {
-            results[indices[j]] = std::move(group_result.results[j]);
-        }
-        if (group_result.vsegment_layouts.has_value()) {
-            MergeVSegmentLayoutTable(layouts, *group_result.vsegment_layouts);
+        // Collect the owner-built table before moving the per-key results out.
+        MergeVSegmentLayoutTablesFromResults(group_result, layouts);
+        for (size_t j = 0; j < indices.size() && j < group_result.size(); ++j) {
+            results[indices[j]] = std::move(group_result[j]);
         }
     }
-#else
-    std::vector<VSegmentLayoutEntry> layouts;
 #endif
 
     // 本地组：视图只由本机 vsegment service 持有，故本机解析；转发组的表
@@ -7676,16 +7671,9 @@ BatchGetReplicaListResponse MasterService::BatchGetReplicaListWithLayouts(
         auto local_layouts = BuildVSegmentLayoutTable(local_vsegments);
         MergeVSegmentLayoutTable(layouts, local_layouts);
     }
-    if (!layouts.empty()) {
-        response.vsegment_layouts = std::move(layouts);
-    }
-    return response;
-}
-
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
-                                   const TenantId& tenant_id) {
-    return BatchGetReplicaListWithLayouts(keys, tenant_id).results;
+    // 批量级别没有独立 envelope（类型码不允许），去重表挂到第一个成功项。
+    AttachVSegmentLayoutTableToFirstSuccess(results, std::move(layouts));
+    return results;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>

@@ -84,25 +84,6 @@ auto WithRequestTenantBatch(std::string_view raw, size_t result_count,
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
 }
 
-// Envelope variant of WithRequestTenantBatch: the batch response carries the
-// per-key results plus a deduplicated vsegment layout table, so a tenant
-// resolution failure fills `results` instead of constructing a bare vector.
-template <typename Fn>
-auto WithRequestTenantBatchEnvelope(std::string_view raw, size_t result_count,
-                                    Fn&& fn) {
-    using Response = std::invoke_result_t<Fn, const TenantId&>;
-    auto tenant_id = ResolveRequestTenantId(raw);
-    if (!tenant_id) {
-        Response response;
-        response.results.resize(result_count);
-        for (auto& item : response.results) {
-            item = tl::make_unexpected(tenant_id.error());
-        }
-        return response;
-    }
-    return std::invoke(std::forward<Fn>(fn), tenant_id.value());
-}
-
 template <typename Fn>
 auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
     using Result = std::invoke_result_t<Fn, const TenantId&>;
@@ -274,13 +255,14 @@ WrappedMasterService::BatchReplicaClear(
     return result;
 }
 
-tl::expected<GetReplicaListByRegexResponse, ErrorCode>
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str,
                                             const std::string& tenant_id) {
-    auto response = execute_rpc(
+    return execute_rpc(
         "GetReplicaListByRegex",
-        [&]() -> tl::expected<GetReplicaListByRegexResponse, ErrorCode> {
-            auto matched = WithRequestTenant(
+        [&] {
+            return WithRequestTenant(
                 master_service_.IsTenantQuotaEnabled()
                     ? std::string_view(tenant_id)
                     : TenantId::kDefaultValue,
@@ -288,29 +270,6 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
                     return master_service_.GetReplicaListByRegex(
                         str, resolved_tenant_id);
                 });
-            if (!matched) {
-                return tl::make_unexpected(matched.error());
-            }
-            GetReplicaListByRegexResponse envelope;
-            std::vector<std::pair<std::string, std::string>> vsegments;
-            for (const auto& matched_item : *matched) {
-                for (const auto& replica : matched_item.second) {
-                    if (!replica.is_vsegment_replica()) continue;
-                    const auto& descriptor =
-                        replica.get_vsegment_descriptor();
-                    vsegments.emplace_back(descriptor.partition_id,
-                                           descriptor.vsegment_id);
-                }
-            }
-            envelope.results = std::move(*matched);
-            if (!vsegments.empty()) {
-                auto layouts =
-                    master_service_.BuildVSegmentLayoutTable(vsegments);
-                if (!layouts.empty()) {
-                    envelope.vsegment_layouts = std::move(layouts);
-                }
-            }
-            return envelope;
         },
         [&](auto& timer) { timer.LogRequest("Regex=", str); },
         [] {
@@ -321,7 +280,6 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
             MasterMetricManager::instance()
                 .inc_get_replica_list_by_regex_failures();
         });
-    return response;
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
@@ -404,9 +362,11 @@ ErrorCode WrappedMasterService::VSegmentPutRevoke(
                                              route_epoch, operation_id);
 }
 
-BatchGetReplicaListResponse WrappedMasterService::BatchGetReplicaList(
-    const std::vector<std::string>& keys, const std::string& tenant_id,
-    uint64_t client_trace_id, const UUID& client_id) {
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
+                                          const std::string& tenant_id,
+                                          uint64_t client_trace_id,
+                                          const UUID& client_id) {
     std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
     if (client_trace_id != 0) {
         trace_scope_ =
@@ -425,23 +385,23 @@ BatchGetReplicaListResponse WrappedMasterService::BatchGetReplicaList(
     MasterMetricManager::instance().inc_batch_get_replica_list_requests(
         total_keys);
 
-    BatchGetReplicaListResponse response;
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     if (sample) {
         // 采样诊断路径：仅当 ShouldSampleHiFreqLog 命中时才逐 key 计时。
         // 历史问题：此处逐 key 循环此前未被 sample 门控，结果随即被批量
         // 结果整体覆盖——纯浪费。实测仅贡献 ~20µs/请求（构建本身 2.5µs/
         // shard），handler 的 ~415µs 大头在服务调用内部其余段，归因见
         // GroupRoute/RecordAccess/HandlerConvert 三子点。
-        response.results.reserve(keys.size());
+        results.reserve(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             const auto item_start = std::chrono::steady_clock::now();
-            response.results.emplace_back(
+            results.emplace_back(
                 master_service_.GetReplicaList(keys[i], TenantId(tenant_id)));
             const auto item_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - item_start)
                     .count();
-            const auto& item = response.results.back();
+            const auto& item = results.back();
             MC_LOG(INFO)
                 << "BatchGetReplicaListItem key=" << keys[i]
                 << " batch_index=" << i << " replica_count="
@@ -459,16 +419,15 @@ BatchGetReplicaListResponse WrappedMasterService::BatchGetReplicaList(
         SpDiag::PerfPoint pt_convert(PerfKey::MASTER_RPC_RESP_CONVERT,
                                      SpDiag::PerfLevel::SUB_SYSTEM);
         pt_convert.Start();
-        response = WithRequestTenantBatchEnvelope(
+        results = WithRequestTenantBatch(
             master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                    : TenantId::kDefaultValue,
             keys.size(), [&](const TenantId& resolved_tenant_id) {
-                return master_service_.BatchGetReplicaListWithLayouts(
-                    keys, resolved_tenant_id);
+                return master_service_.BatchGetReplicaList(keys,
+                                                           resolved_tenant_id);
             });
         pt_convert.End(0);
     }
-    auto& results = response.results;
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -510,7 +469,7 @@ BatchGetReplicaListResponse WrappedMasterService::BatchGetReplicaList(
                      << " latency_us=" << latency_us;
     }
     pt.End(failure_count == total_keys ? -1 : 0);
-    return response;
+    return results;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -696,10 +655,13 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
-BatchPutStartResponse WrappedMasterService::BatchPutStart(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
-    const std::string& tenant_id, uint64_t client_trace_id) {
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+WrappedMasterService::BatchPutStart(const UUID& client_id,
+                                    const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& slice_lengths,
+                                    const ReplicateConfig& config,
+                                    const std::string& tenant_id,
+                                    uint64_t client_trace_id) {
     std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
     if (client_trace_id != 0) {
         trace_scope_ =
@@ -802,26 +764,7 @@ BatchPutStartResponse WrappedMasterService::BatchPutStart(
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     pt.End(failure_count == total_keys ? -1 : 0);
-
-    BatchPutStartResponse response;
-    response.results = std::move(results);
-    std::vector<std::pair<std::string, std::string>> vsegments;
-    for (const auto& result : response.results) {
-        if (!result) continue;
-        for (const auto& replica : *result) {
-            if (!replica.is_vsegment_replica()) continue;
-            const auto& descriptor = replica.get_vsegment_descriptor();
-            vsegments.emplace_back(descriptor.partition_id,
-                                   descriptor.vsegment_id);
-        }
-    }
-    if (!vsegments.empty()) {
-        auto layouts = master_service_.BuildVSegmentLayoutTable(vsegments);
-        if (!layouts.empty()) {
-            response.vsegment_layouts = std::move(layouts);
-        }
-    }
-    return response;
+    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
@@ -1004,7 +947,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
-BatchUpsertStartResponse WrappedMasterService::BatchUpsertStart(
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+WrappedMasterService::BatchUpsertStart(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
     const std::string& tenant_id) {
@@ -1058,26 +1002,7 @@ BatchUpsertStartResponse WrappedMasterService::BatchUpsertStart(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
-
-    BatchUpsertStartResponse response;
-    response.results = std::move(results);
-    std::vector<std::pair<std::string, std::string>> vsegments;
-    for (const auto& result : response.results) {
-        if (!result) continue;
-        for (const auto& replica : *result) {
-            if (!replica.is_vsegment_replica()) continue;
-            const auto& descriptor = replica.get_vsegment_descriptor();
-            vsegments.emplace_back(descriptor.partition_id,
-                                   descriptor.vsegment_id);
-        }
-    }
-    if (!vsegments.empty()) {
-        auto layouts = master_service_.BuildVSegmentLayoutTable(vsegments);
-        if (!layouts.empty()) {
-            response.vsegment_layouts = std::move(layouts);
-        }
-    }
-    return response;
+    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
@@ -2123,18 +2048,18 @@ WrappedMasterService::InterMasterGetReplicaList(const std::string& key,
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
-BatchGetReplicaListResponse
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::InterMasterBatchGetReplicaList(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "InterMasterBatchGetReplicaList");
     timer.LogRequest("keys_count=", keys.size());
     // This master is the slot owner for `keys` (peer trust), so its vsegment
-    // service can resolve the layouts; relay them in the batch envelope.
-    BatchGetReplicaListResponse response;
-    response.results =
+    // service can resolve the layouts. The table rides on the first successful
+    // per-key response (a batch envelope would change the wire type).
+    auto results =
         master_service_.InterMasterBatchGetReplicaList(keys, tenant_id);
     std::vector<std::pair<std::string, std::string>> vsegments;
-    for (const auto& result : response.results) {
+    for (const auto& result : results) {
         if (!result) continue;
         for (const auto& replica : result->replicas) {
             if (!replica.is_vsegment_replica()) continue;
@@ -2145,11 +2070,9 @@ WrappedMasterService::InterMasterBatchGetReplicaList(
     }
     if (!vsegments.empty()) {
         auto layouts = master_service_.BuildVSegmentLayoutTable(vsegments);
-        if (!layouts.empty()) {
-            response.vsegment_layouts = std::move(layouts);
-        }
+        AttachVSegmentLayoutTableToFirstSuccess(results, std::move(layouts));
     }
-    return response;
+    return results;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>

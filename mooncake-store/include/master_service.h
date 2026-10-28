@@ -595,15 +595,6 @@ class MasterService {
                         const TenantId& tenant_id);
 
     /**
-     * @brief Same as BatchGetReplicaList, but returns the batch envelope with
-     * the deduplicated vsegment layout table (local entries + tables relayed
-     * by peer masters). The vector-only variant above is kept for internal
-     * callers that do not consume layouts.
-     */
-    BatchGetReplicaListResponse BatchGetReplicaListWithLayouts(
-        const std::vector<std::string>& keys, const TenantId& tenant_id);
-
-    /**
      * @brief Read-only batch replica list query for admin use.
      * Unlike BatchGetReplicaList, this does not grant leases, trigger
      * promotion, or update cache-hit metrics.

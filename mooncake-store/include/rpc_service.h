@@ -60,7 +60,9 @@ class WrappedMasterService {
         const std::vector<std::string>& object_keys, const UUID& client_id,
         const std::string& segment_name);
 
-    tl::expected<GetReplicaListByRegexResponse, ErrorCode>
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
     GetReplicaListByRegex(const std::string& str,
                           const std::string& tenant_id = "default");
 
@@ -84,10 +86,11 @@ class WrappedMasterService {
                                 uint64_t route_epoch,
                                 const std::string& operation_id);
 
-    BatchGetReplicaListResponse BatchGetReplicaList(
-        const std::vector<std::string>& keys,
-        const std::string& tenant_id = "default", uint64_t client_trace_id = 0,
-        const UUID& client_id = {});
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys,
+                        const std::string& tenant_id = "default",
+                        uint64_t client_trace_id = 0,
+                        const UUID& client_id = {});
 
     // Read-only admin variants: no lease grants, no promotion, no metric
     // updates.
@@ -115,11 +118,12 @@ class WrappedMasterService {
         const std::string& tenant_id = "default",
         const std::string& operation_id = "");
 
-    BatchPutStartResponse BatchPutStart(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<uint64_t>& slice_lengths,
-        const ReplicateConfig& config, const std::string& tenant_id = "default",
-        uint64_t client_trace_id = 0);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config,
+                  const std::string& tenant_id = "default",
+                  uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
@@ -148,10 +152,12 @@ class WrappedMasterService {
         const std::string& tenant_id = "default",
         const std::string& operation_id = "");
 
-    BatchUpsertStartResponse BatchUpsertStart(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<uint64_t>& slice_lengths,
-        const ReplicateConfig& config, const std::string& tenant_id = "default");
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const UUID& client_id,
+                     const std::vector<std::string>& keys,
+                     const std::vector<uint64_t>& slice_lengths,
+                     const ReplicateConfig& config,
+                     const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
@@ -361,8 +367,9 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> InterMasterGetReplicaList(
         const std::string& key, const std::string& tenant_id);
 
-    BatchGetReplicaListResponse InterMasterBatchGetReplicaList(
-        const std::vector<std::string>& keys, const std::string& tenant_id);
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    InterMasterBatchGetReplicaList(const std::vector<std::string>& keys,
+                                   const std::string& tenant_id);
 
     // Inter-master write forwarding (model B): relays a FULL PutStart to the
     // slot-owning submaster so it allocates + writes metadata locally.

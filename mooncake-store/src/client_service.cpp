@@ -1447,10 +1447,9 @@ Client::BatchQueryIp(const std::vector<UUID>& client_ids) {
     return result;
 }
 
-tl::expected<GetReplicaListByRegexResponse, ErrorCode> Client::QueryByRegex(
-    const std::string& str) {
-    // 完整版 C：返回 envelope（map + 去重 layout 表）。当前无 in-tree
-    // 调用方，表原样透传即可。
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
+Client::QueryByRegex(const std::string& str) {
     return master_client_.GetReplicaListByRegex(str);
 }
 
@@ -1504,9 +1503,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     pt.Start();
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto batch_response =
+    auto response =
         master_client_.BatchGetReplicaList(object_keys, tenant_id);
-    auto& response = batch_response.results;
 
     // 松耦合重路由：任一项返回 SLOT_NOT_OWNED 说明视图过期，刷新一次后
     // 整体重试；读操作幂等，重复查询已成功项无害。
@@ -1530,7 +1528,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             pt_refresh.Start();
             TryLoadRoutingOnce();
             pt_refresh.End(0);
-            batch_response =
+            response =
                 master_client_.BatchGetReplicaList(object_keys, tenant_id);
         }
     }
@@ -1548,11 +1546,15 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         pt.End(-1);
         return results;
     }
-    // 整个批次共享同一张去重表；旧 master 没有 envelope 表时退回逐 key。
+    // 批量级别的去重表挂在第一个成功响应上（wire 类型不变，天然兼容）；
+    // 整个批次共享同一个 shared_ptr。旧 master 不带表 → 逐 key 回退。
+    std::vector<VSegmentLayoutEntry> batch_layout_entries;
+    MergeVSegmentLayoutTablesFromResults(response, batch_layout_entries);
     std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
-    if (batch_response.vsegment_layouts.has_value()) {
-        batch_layouts = std::make_shared<const std::vector<VSegmentLayoutEntry>>(
-            *batch_response.vsegment_layouts);
+    if (!batch_layout_entries.empty()) {
+        batch_layouts =
+            std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+                std::move(batch_layout_entries));
     }
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
     results.reserve(response.size());
@@ -1563,9 +1565,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
                 response[i].value().object_checksum);
-            query.vsegment_layouts =
-                batch_layouts ? batch_layouts
-                              : MakeVSegmentLayouts(response[i].value());
+            query.vsegment_layouts = batch_layouts;
             results.emplace_back(std::move(query));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
@@ -2801,15 +2801,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     SpDiag::PerfPoint pt_batch_start(PerfKey::PUT_BATCH_PUT_START,
                                      SpDiag::PerfLevel::MODULE);
     pt_batch_start.Start();
-    auto start_response =
+    auto start_responses =
         master_client_.BatchPutStart(keys, slice_lengths, config);
-    auto& start_responses = start_response.results;
-    // 整个批次共享同一张去重表。
-    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
-    if (start_response.vsegment_layouts.has_value()) {
-        batch_layouts = std::make_shared<const std::vector<VSegmentLayoutEntry>>(
-            *start_response.vsegment_layouts);
-    }
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2840,7 +2833,6 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 "Master failed to start put operation");
         } else {
             op.replicas = start_responses[i].value();
-            op.vsegment_layouts = batch_layouts;
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2894,14 +2886,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         return;
     }
 
-    auto start_response =
+    auto start_responses =
         master_client_.BatchUpsertStart(keys, slice_lengths, config);
-    auto& start_responses = start_response.results;
-    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> batch_layouts;
-    if (start_response.vsegment_layouts.has_value()) {
-        batch_layouts = std::make_shared<const std::vector<VSegmentLayoutEntry>>(
-            *start_response.vsegment_layouts);
-    }
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2925,7 +2911,6 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                         "Master failed to start upsert operation");
         } else {
             op.replicas = start_responses[i].value();
-            op.vsegment_layouts = batch_layouts;
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
