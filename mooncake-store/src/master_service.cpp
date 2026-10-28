@@ -7201,36 +7201,6 @@ auto MasterService::GetReplicaList(const std::string& key,
     return GetReplicaListLocal(object_id);
 }
 
-tl::expected<vsegment::VSegmentView, ErrorCode>
-MasterService::GetVSegmentView(const std::string& partition_id,
-                               const std::string& vsegment_id) {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
-    const auto ready = CheckVSegmentServiceability(partition_id);
-    if (ready != ErrorCode::OK) return tl::make_unexpected(ready);
-    if (!vsegment_service_)
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    vsegment::VSegmentView view;
-    auto result =
-        vsegment_service_->LoadView(partition_id, vsegment_id, &view);
-    if (result != ErrorCode::OK) return tl::make_unexpected(result);
-    return view;
-}
-
-tl::expected<vsegment::PSegmentLocation, ErrorCode>
-MasterService::GetPSegmentEndpoint(const std::string& segment_id) {
-    UUID id;
-    if (!StringToUuid(segment_id, id))
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    ScopedSegmentAccess access = segment_manager_.getSegmentAccess();
-    Segment segment;
-    if (!access.GetSegment(id, segment))
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    if (segment.te_endpoint.empty())
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    return vsegment::PSegmentLocation{
-        segment.te_endpoint, static_cast<uint64_t>(segment.base)};
-}
-
 namespace {
 bool VSegmentInlineLayoutEnabled() {
     const char* env = std::getenv("MC_VSEGMENT_INLINE_LAYOUT");
@@ -9776,6 +9746,25 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         replica_ids.push_back(replica.id());
         response.targets.emplace_back(replica.get_descriptor());
     }
+    // Hard C: the client reads the copy source with the table carried here;
+    // it has no GetVSegmentView/GetPSegmentEndpoint fallback.
+    {
+        std::vector<std::pair<std::string, std::string>> vsegments;
+        auto collect = [&vsegments](const Replica::Descriptor& replica) {
+            if (!replica.is_vsegment_replica()) return;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            vsegments.emplace_back(descriptor.partition_id,
+                                   descriptor.vsegment_id);
+        };
+        collect(response.source);
+        for (const auto& target : response.targets) collect(target);
+        if (!vsegments.empty()) {
+            auto layouts = BuildVSegmentLayoutTable(vsegments);
+            if (!layouts.empty()) {
+                response.vsegment_layouts = std::move(layouts);
+            }
+        }
+    }
 
     // Create replication task for tracking.
     auto& tenant_state = accessor.GetTenantState();
@@ -10102,6 +10091,25 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         response.target = replicas[0].get_descriptor();
     } else {
         response.target = std::nullopt;
+    }
+    // Hard C: the client transfers the move source with the table carried
+    // here; it has no GetVSegmentView/GetPSegmentEndpoint fallback.
+    {
+        std::vector<std::pair<std::string, std::string>> vsegments;
+        auto collect = [&vsegments](const Replica::Descriptor& replica) {
+            if (!replica.is_vsegment_replica()) return;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            vsegments.emplace_back(descriptor.partition_id,
+                                   descriptor.vsegment_id);
+        };
+        collect(response.source);
+        if (response.target.has_value()) collect(*response.target);
+        if (!vsegments.empty()) {
+            auto layouts = BuildVSegmentLayoutTable(vsegments);
+            if (!layouts.empty()) {
+                response.vsegment_layouts = std::move(layouts);
+            }
+        }
     }
 
     // Create replication task for tracking.

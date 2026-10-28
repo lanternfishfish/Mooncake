@@ -996,10 +996,6 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
-    std::unique_ptr<vsegment::VSegmentViewProvider> vsegment_view_provider_;
-    std::unique_ptr<vsegment::SegmentEndpointResolver>
-        vsegment_endpoint_resolver_;
-    std::unique_ptr<vsegment::VSegmentViewCache> vsegment_view_cache_;
     std::shared_ptr<vsegment::VSegmentTransferPlanner>
         vsegment_transfer_planner_;
     // Registered client memory used when Copy/Move reads a non-local source
@@ -1131,7 +1127,8 @@ class Client {
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets,
+        const std::vector<VSegmentLayoutEntry>* layouts);
 
     /**
      * @brief Copy an object's replica to target segments

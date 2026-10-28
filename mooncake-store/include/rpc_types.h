@@ -216,8 +216,13 @@ YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
 struct CopyStartResponse {
     Replica::Descriptor source;
     std::vector<Replica::Descriptor> targets;
+    // Hard C: layout table for vsegment descriptors in source/targets. The
+    // client has no endpoint RPC to fall back to, so a vsegment copy without
+    // this table fails.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 };
-YLT_REFL(CopyStartResponse, source, targets);
+YLT_REFL(CopyStartResponse, source, targets, vsegment_layouts);
 
 /**
  * @brief Response structure for PromotionAllocStart (L2->L1 promotion-on-hit).
@@ -234,8 +239,10 @@ YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
 struct MoveStartResponse {
     Replica::Descriptor source;
     std::optional<Replica::Descriptor> target;
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 };
-YLT_REFL(MoveStartResponse, source, target);
+YLT_REFL(MoveStartResponse, source, target, vsegment_layouts);
 
 /**
  * @brief Response structure for InterMasterHandshake: identity + ownership

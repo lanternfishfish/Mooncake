@@ -205,13 +205,10 @@ class MasterService {
     // 测试专用：阻塞等待 stale-evict 异步 drain 队列清空（含 1s debounce
     // 与在途请求），上限 5s。生产代码勿用；non-etcd 构建为空操作。
     void FlushStaleEvictQueueForTesting();
-    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
-        const std::string& partition_id, const std::string& vsegment_id);
-    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
-        const std::string& segment_id);
     // Builds a deduplicated layout table for the given (partition_id,
     // vsegment_id) pairs. Best-effort: entries that cannot be resolved are
-    // omitted; callers fall back to GetVSegmentView/GetPSegmentEndpoint.
+    // omitted (hard C has no legacy fallback; callers fail for those
+    // vsegments).
     std::vector<VSegmentLayoutEntry> BuildVSegmentLayoutTable(
         const std::vector<std::pair<std::string, std::string>>& vsegments);
     // Attaches the runtime layout table for the vsegment replicas contained in

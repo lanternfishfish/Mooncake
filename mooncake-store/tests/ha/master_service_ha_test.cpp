@@ -671,9 +671,6 @@ TEST_F(MasterServiceHATest, GainedSlotsWaitForMetadataAndRemainPendingOnRetry) {
 TEST_F(MasterServiceHATest, VSegmentRpcRejectsUnreadyAndReleasedPartitions) {
     MasterService service(MasterServiceConfig{});
     ExpectSlots(service, {7});
-    auto view = service.GetVSegmentView("7", "vs-7");
-    ASSERT_FALSE(view);
-    EXPECT_EQ(view.error(), ErrorCode::SLOT_MIGRATING);
     auto start = service.VSegmentPutStart("7", 1, "put", 64, "default");
     EXPECT_EQ(start.error, ErrorCode::SLOT_MIGRATING);
     EXPECT_EQ(service.VSegmentPutRevoke("7", "vs-7", 1, "put"),

@@ -328,17 +328,6 @@ WrappedMasterService::GetReplicaList(const std::string& key,
     return result;
 }
 
-tl::expected<vsegment::VSegmentView, ErrorCode>
-WrappedMasterService::GetVSegmentView(const std::string& partition_id,
-                                      const std::string& vsegment_id) {
-    return master_service_.GetVSegmentView(partition_id, vsegment_id);
-}
-
-tl::expected<vsegment::PSegmentLocation, ErrorCode>
-WrappedMasterService::GetPSegmentEndpoint(const std::string& segment_id) {
-    return master_service_.GetPSegmentEndpoint(segment_id);
-}
-
 vsegment::VSegmentPutStartResult WrappedMasterService::VSegmentPutStart(
     const std::string& partition_id, uint64_t route_epoch,
     const std::string& operation_id, uint64_t length,
@@ -2243,11 +2232,6 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetVSegmentView>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetPSegmentEndpoint>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::VSegmentPutStart>(
         &wrapped_master_service);

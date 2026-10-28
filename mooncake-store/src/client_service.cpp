@@ -198,52 +198,6 @@ struct ReplicaTransferSummary {
     }
 };
 
-class MasterClientVSegmentViewProvider final
-    : public vsegment::VSegmentViewProvider {
-   public:
-    explicit MasterClientVSegmentViewProvider(MasterClient* master_client)
-        : master_client_(master_client) {}
-
-    ErrorCode LoadView(const std::string& partition_id,
-                       const std::string& vsegment_id,
-                       vsegment::VSegmentView* view,
-                       std::string* detail) override {
-        if (!master_client_ || !view) return ErrorCode::INVALID_PARAMS;
-        auto result =
-            master_client_->GetVSegmentView(partition_id, vsegment_id);
-        if (!result) {
-            if (detail) *detail = "failed to load vsegment view from owner";
-            return result.error();
-        }
-        *view = std::move(result.value());
-        return ErrorCode::OK;
-    }
-
-   private:
-    MasterClient* master_client_;
-};
-
-class MasterClientSegmentEndpointResolver final
-    : public vsegment::SegmentEndpointResolver {
-   public:
-    explicit MasterClientSegmentEndpointResolver(MasterClient* master_client)
-        : master_client_(master_client) {}
-
-    ErrorCode ResolveLocation(
-        const std::string& segment_id,
-        vsegment::PSegmentLocation* location) override {
-        if (!master_client_ || !location) return ErrorCode::INVALID_PARAMS;
-        auto result = master_client_->GetPSegmentEndpoint(segment_id);
-        if (!result) return result.error();
-        *location = std::move(result.value());
-        return location->endpoint.empty() ? ErrorCode::INVALID_PARAMS
-                                          : ErrorCode::OK;
-    }
-
-   private:
-    MasterClient* master_client_;
-};
-
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
     if (config.nof_replica_num == 0) {
@@ -1253,15 +1207,8 @@ void Client::InitTransferSubmitter() {
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 #endif
-    vsegment_view_provider_ =
-        std::make_unique<MasterClientVSegmentViewProvider>(&master_client_);
-    vsegment_endpoint_resolver_ =
-        std::make_unique<MasterClientSegmentEndpointResolver>(&master_client_);
-    vsegment_view_cache_ = std::make_unique<vsegment::VSegmentViewCache>();
     vsegment_transfer_planner_ =
-        std::make_shared<vsegment::VSegmentTransferPlanner>(
-            vsegment_view_provider_.get(), vsegment_endpoint_resolver_.get(),
-            vsegment_view_cache_.get());
+        std::make_shared<vsegment::VSegmentTransferPlanner>();
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -4718,7 +4665,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
-    const std::vector<Replica::Descriptor>& targets) {
+    const std::vector<Replica::Descriptor>& targets,
+    const std::vector<VSegmentLayoutEntry>* layouts) {
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -4769,7 +4717,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
             return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         slices = split_into_slices(*staging);
-        if (TransferRead(source, slices) != ErrorCode::OK) {
+        if (TransferRead(source, slices, layouts) != ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -4777,7 +4725,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
+        if (TransferWrite(target, slices, nullptr, layouts) !=
+            ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -4834,7 +4783,9 @@ tl::expected<void, ErrorCode> Client::Copy(
     auto result = ExecuteReplicaTransfer(
         key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
         [&]() { return master_client_.CopyRevoke(key, tenant_id); },
-        response.source, response.targets);
+        response.source, response.targets,
+        response.vsegment_layouts.has_value() ? &*response.vsegment_layouts
+                                              : nullptr);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -4889,7 +4840,9 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     auto result = ExecuteReplicaTransfer(
         key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
         [&]() { return master_client_.MoveRevoke(key, tenant_id); },
-        response.source, targets);
+        response.source, targets,
+        response.vsegment_layouts.has_value() ? &*response.vsegment_layouts
+                                              : nullptr);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key

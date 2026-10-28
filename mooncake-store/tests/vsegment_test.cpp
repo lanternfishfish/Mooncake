@@ -21,6 +21,7 @@
 #include <future>
 #include <limits>
 #include <map>
+#include <set>
 #include <thread>
 
 namespace mooncake::vsegment {
@@ -312,35 +313,6 @@ class TestStateCommitter : public VSegmentStateCommitter {
     std::string fail_mutation;
     std::vector<std::string> mutations;
     PartitionVSegmentSnapshot last_state;
-};
-
-class TestViewProvider : public VSegmentViewProvider {
-   public:
-    ErrorCode LoadView(const std::string& partition_id,
-                       const std::string& vsegment_id, VSegmentView* output,
-                       std::string*) override {
-        ++loads;
-        if (view.partition_id != partition_id ||
-            view.vsegment_id != vsegment_id)
-            return ErrorCode::SEGMENT_NOT_FOUND;
-        *output = view;
-        return ErrorCode::OK;
-    }
-    int loads{0};
-    VSegmentView view;
-};
-
-class TestEndpointResolver : public SegmentEndpointResolver {
-   public:
-    ErrorCode ResolveLocation(const std::string& segment_id,
-                              PSegmentLocation* location) override {
-        ++resolves;
-        location->endpoint = "endpoint://" + segment_id;
-        location->base_address = base_address;
-        return ErrorCode::OK;
-    }
-    uint64_t base_address{4096};
-    int resolves{0};
 };
 
 std::shared_ptr<TestStateCommitter> Committer() {
@@ -710,50 +682,6 @@ TEST(VSegmentResolverTest, RejectsBufferLengthMismatchAndLogicalOverflow) {
               ErrorCode::INVALID_PARAMS);
 }
 
-TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
-    PartitionQuotaAllocator allocator(Config());
-    auto allocation = allocator.Allocate("vs-1", Profile());
-    ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
-    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
-
-    auto first = planner.Plan(replica, {{1000, 96}});
-    ASSERT_TRUE(first) << first.detail;
-    ASSERT_EQ(first.requests.size(), 3);
-    EXPECT_EQ(first.requests[0].endpoint, "endpoint://segment-a");
-    EXPECT_EQ(first.requests[0].transfer.physical_offset, 4096 + 48);
-    EXPECT_EQ(first.requests[1].endpoint, "endpoint://segment-b");
-    EXPECT_EQ(provider.loads, 1);
-
-    auto cached = planner.Plan(replica, {{2000, 96}});
-    ASSERT_TRUE(cached);
-    EXPECT_EQ(provider.loads, 1);
-}
-
-TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
-    PartitionQuotaAllocator allocator(Config());
-    auto allocation = allocator.Allocate("vs-1", Profile());
-    ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
-
-    // 512 bytes over 64-byte stripes = 8 sub-requests, but only 2 distinct
-    // psegments (member_count = 2). The resolver must be hit once per
-    // distinct segment, not once per sub-request.
-    VSegmentDescriptor replica{"partition-1", "vs-1", 0, 512};
-    auto plan = planner.Plan(replica, {{1000, 512}});
-    ASSERT_TRUE(plan) << plan.detail;
-    ASSERT_EQ(plan.requests.size(), 8u);
-    EXPECT_EQ(endpoints.resolves, 2);
-}
-
 VSegmentLayoutEntry MakeLayoutEntryFromView(const VSegmentView& view,
                                             uint64_t base_address) {
     VSegmentLayoutEntry entry;
@@ -773,15 +701,11 @@ VSegmentLayoutEntry MakeLayoutEntryFromView(const VSegmentView& view,
     return entry;
 }
 
-TEST(VSegmentTransferPlannerTest, UsesInlineLayoutWithoutRpc) {
+TEST(VSegmentTransferPlannerTest, UsesInlineLayoutTable) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
     ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentTransferPlanner planner;
     VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
     std::vector<VSegmentLayoutEntry> layouts{MakeLayoutEntryFromView(
         allocation.view, /*base_address=*/0x200000)};
@@ -791,205 +715,114 @@ TEST(VSegmentTransferPlannerTest, UsesInlineLayoutWithoutRpc) {
     ASSERT_EQ(plan.requests.size(), 3u);
     EXPECT_EQ(plan.requests[0].endpoint, "inline://segment-a");
     EXPECT_EQ(plan.requests[0].transfer.physical_offset, 0x200000 + 48);
-    EXPECT_EQ(endpoints.resolves, 0);
-    EXPECT_EQ(provider.loads, 0);
-    VSegmentView unused;
-    EXPECT_FALSE(cache.Find(replica.partition_id, replica.vsegment_id, &unused));
 }
 
-TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutChecksumMismatch) {
+TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctMemberEndpoint) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
     ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
-    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
-    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
-    entry.checksum ^= 1;
-    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+    VSegmentTransferPlanner planner;
+    std::vector<VSegmentLayoutEntry> layouts{MakeLayoutEntryFromView(
+        allocation.view, /*base_address=*/0x200000)};
 
-    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    // 512 bytes over 64-byte stripes = 8 sub-requests across 2 distinct
+    // members (member_count = 2).
+    VSegmentDescriptor replica{"partition-1", "vs-1", 0, 512};
+    auto plan = planner.Plan(replica, {{1000, 512}}, &layouts);
     ASSERT_TRUE(plan) << plan.detail;
-    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
-    EXPECT_EQ(provider.loads, 1);
-    EXPECT_EQ(endpoints.resolves, 2);
+    ASSERT_EQ(plan.requests.size(), 8u);
+    std::set<std::string> endpoints;
+    for (const auto& request : plan.requests) {
+        endpoints.insert(request.endpoint);
+    }
+    EXPECT_EQ(endpoints.size(), 2u);
 }
 
-TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutMemberHasNoEndpoint) {
-    PartitionQuotaAllocator allocator(Config());
-    auto allocation = allocator.Allocate("vs-1", Profile());
-    ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+TEST(VSegmentTransferPlannerTest, RequiresLayoutTable) {
+    VSegmentTransferPlanner planner;
     VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
-    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
-    ASSERT_FALSE(entry.members.empty());
-    entry.members.front().endpoint.clear();
-    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
 
-    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
-    ASSERT_TRUE(plan) << plan.detail;
-    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
-    EXPECT_EQ(provider.loads, 1);
-    EXPECT_EQ(endpoints.resolves, 2);
+    auto plan = planner.Plan(replica, {{1000, 96}}, nullptr);
+    EXPECT_EQ(plan.error, ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_NE(plan.detail.find("required but absent"), std::string::npos);
+    EXPECT_TRUE(plan.requests.empty());
 }
 
-TEST(VSegmentTransferPlannerTest, ShadowModeStillResolvesLegacyPath) {
+TEST(VSegmentTransferPlannerTest, RejectsTableWithoutMatchingVSegment) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
     ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
-    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
-    std::vector<VSegmentLayoutEntry> layouts{
-        MakeLayoutEntryFromView(allocation.view, 0x200000)};
-
-    ASSERT_EQ(setenv("MC_VSEGMENT_LAYOUT_SHADOW", "1", 1), 0);
-    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
-    unsetenv("MC_VSEGMENT_LAYOUT_SHADOW");
-
-    ASSERT_TRUE(plan) << plan.detail;
-    // Shadow mode must not consume the inline table: the legacy view load and
-    // endpoint RPCs still happen, and the plan uses the legacy endpoints.
-    EXPECT_EQ(provider.loads, 1);
-    EXPECT_EQ(endpoints.resolves, 2);
-    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
-    EXPECT_EQ(plan.requests[0].transfer.physical_offset, 4096 + 48);
-}
-
-TEST(VSegmentTransferPlannerTest, FeatureFlagDisablesClientConsumption) {
-    PartitionQuotaAllocator allocator(Config());
-    auto allocation = allocator.Allocate("vs-1", Profile());
-    ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
-    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
-    std::vector<VSegmentLayoutEntry> layouts{
-        MakeLayoutEntryFromView(allocation.view, 0x200000)};
-
-    ASSERT_EQ(setenv("MC_VSEGMENT_INLINE_LAYOUT", "0", 1), 0);
-    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
-    unsetenv("MC_VSEGMENT_INLINE_LAYOUT");
-
-    ASSERT_TRUE(plan) << plan.detail;
-    // The kill switch must ignore the table on the client: legacy RPCs run and
-    // the legacy endpoints are used, even though the table is valid.
-    EXPECT_EQ(provider.loads, 1);
-    EXPECT_EQ(endpoints.resolves, 2);
-    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
-}
-
-TEST(VSegmentTransferPlannerTest, FallsBackWhenLayoutHasNoMatchingVSegment) {
-    PartitionQuotaAllocator allocator(Config());
-    auto allocation = allocator.Allocate("vs-1", Profile());
-    ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentTransferPlanner planner;
     VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
     auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
     entry.vsegment_id = "vs-other";
     std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
 
     auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
-    ASSERT_TRUE(plan) << plan.detail;
-    EXPECT_EQ(plan.requests[0].endpoint, "endpoint://segment-a");
-    EXPECT_EQ(provider.loads, 1);
+    EXPECT_EQ(plan.error, ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_NE(plan.detail.find("no entry for vs-1"), std::string::npos);
+    EXPECT_TRUE(plan.requests.empty());
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsLayoutFromAnotherPartition) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    entry.partition_id = "partition-2";
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    EXPECT_EQ(plan.error, ErrorCode::INVALID_VERSION);
+    EXPECT_TRUE(plan.requests.empty());
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsLayoutChecksumMismatch) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    entry.checksum ^= 1;
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    EXPECT_EQ(plan.error, ErrorCode::CHECKSUM_MISMATCH);
+    EXPECT_TRUE(plan.requests.empty());
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsLayoutMemberWithoutEndpoint) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    ASSERT_FALSE(entry.members.empty());
+    entry.members.front().endpoint.clear();
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    // An unmounted member has no endpoint and hard C has no RPC fallback.
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    EXPECT_EQ(plan.error, ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_NE(plan.detail.find("no endpoint"), std::string::npos);
+    EXPECT_TRUE(plan.requests.empty());
 }
 
 TEST(VSegmentTransferPlannerTest, RejectsAbsoluteAddressOverflow) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
     ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    endpoints.base_address = std::numeric_limits<uint64_t>::max();
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentTransferPlanner planner;
     VSegmentDescriptor replica{"partition-1", "vs-1", 1, 8};
-    EXPECT_EQ(planner.Plan(replica, {{1000, 8}}).error,
+    std::vector<VSegmentLayoutEntry> layouts{MakeLayoutEntryFromView(
+        allocation.view, std::numeric_limits<uint64_t>::max())};
+
+    EXPECT_EQ(planner.Plan(replica, {{1000, 8}}, &layouts).error,
               ErrorCode::INVALID_PARAMS);
-}
-
-TEST(VSegmentTransferPlannerTest, RejectsConflictingCachedView) {
-    PartitionQuotaAllocator allocator(Config());
-    auto allocation = allocator.Allocate("vs-1", Profile());
-    ASSERT_TRUE(allocation);
-    VSegmentViewCache cache;
-    ASSERT_EQ(cache.Insert(allocation.view), ErrorCode::OK);
-    auto conflicting = allocation.view;
-    conflicting.members[0].base_offset += 8;
-    conflicting.checksum = ComputeViewChecksum(conflicting);
-    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::INVALID_VERSION);
-}
-
-TEST(VSegmentViewCacheTest, ComparesLayoutInsteadOfTrustingChecksum) {
-    auto original = View();
-    VSegmentViewCache cache;
-    ASSERT_EQ(cache.Insert(original), ErrorCode::OK);
-
-    auto conflicting = original;
-    conflicting.members[0].base_offset += original.stripe_size;
-    // Simulate a checksum collision or incorrectly copied checksum. Structure
-    // remains valid because checksum still matches the supplied value only
-    // after deliberately retaining the original checksum.
-    conflicting.checksum = original.checksum;
-    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::CHECKSUM_MISMATCH);
-
-    conflicting.checksum = ComputeViewChecksum(conflicting);
-    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::INVALID_VERSION);
-}
-
-TEST(VSegmentViewCacheTest, ScopesIdentityByPartition) {
-    auto first = View();
-    auto second = first;
-    second.partition_id = "partition-2";
-    second.stripe_size *= 2;
-    second.checksum = ComputeViewChecksum(second);
-
-    VSegmentViewCache cache;
-    ASSERT_EQ(cache.Insert(first), ErrorCode::OK);
-    ASSERT_EQ(cache.Insert(second), ErrorCode::OK);
-    VSegmentView loaded;
-    ASSERT_TRUE(cache.Find(first.partition_id, first.vsegment_id, &loaded));
-    EXPECT_EQ(loaded.stripe_size, first.stripe_size);
-    ASSERT_TRUE(cache.Find(second.partition_id, second.vsegment_id, &loaded));
-    EXPECT_EQ(loaded.stripe_size, second.stripe_size);
-}
-
-TEST(VSegmentViewCacheTest, EvictsOldestViewAtCapacity) {
-    VSegmentViewCache cache(2);
-    auto first = View();
-    auto second = first;
-    second.vsegment_id = "vs-2";
-    second.checksum = ComputeViewChecksum(second);
-    auto third = first;
-    third.vsegment_id = "vs-3";
-    third.checksum = ComputeViewChecksum(third);
-
-    ASSERT_EQ(cache.Insert(first), ErrorCode::OK);
-    ASSERT_EQ(cache.Insert(second), ErrorCode::OK);
-    ASSERT_EQ(cache.Insert(third), ErrorCode::OK);
-    EXPECT_EQ(cache.Size(), 2u);
-    VSegmentView loaded;
-    EXPECT_FALSE(cache.Find(first.partition_id, first.vsegment_id, &loaded));
-    EXPECT_TRUE(cache.Find(second.partition_id, second.vsegment_id, &loaded));
-    EXPECT_TRUE(cache.Find(third.partition_id, third.vsegment_id, &loaded));
 }
 
 TEST(VSegmentViewTest, KeepsProfileIdentityOutsideImmutableView) {
