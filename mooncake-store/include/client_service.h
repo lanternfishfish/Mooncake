@@ -988,6 +988,9 @@ class Client {
     std::unique_ptr<vsegment::SegmentEndpointResolver>
         vsegment_endpoint_resolver_;
     std::unique_ptr<vsegment::VSegmentViewCache> vsegment_view_cache_;
+    // Runtime psegment locations (endpoint + base) keyed by segment_id. Shared
+    // with the planner and consulted on transfer failure to evict dead holders.
+    std::shared_ptr<vsegment::SegmentLocationCache> vsegment_endpoint_cache_;
     std::shared_ptr<vsegment::VSegmentTransferPlanner>
         vsegment_transfer_planner_;
     // Registered client memory used when Copy/Move reads a non-local source

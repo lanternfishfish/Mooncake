@@ -549,7 +549,9 @@ TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
     provider.view = allocation.view;
     TestEndpointResolver endpoints;
     VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    SegmentLocationCache locations;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache,
+                                     &locations);
     VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
 
     auto first = planner.Plan(replica, {{1000, 96}});
@@ -563,6 +565,9 @@ TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
     auto cached = planner.Plan(replica, {{2000, 96}});
     ASSERT_TRUE(cached);
     EXPECT_EQ(provider.loads, 1);
+    // Endpoints are cached across Plans as well: the second Plan must not
+    // re-resolve either member.
+    EXPECT_EQ(endpoints.resolves, 2);
 }
 
 TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
@@ -573,7 +578,9 @@ TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
     provider.view = allocation.view;
     TestEndpointResolver endpoints;
     VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    SegmentLocationCache locations;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache,
+                                     &locations);
 
     // 512 bytes over 64-byte stripes = 8 sub-requests, but only 2 distinct
     // psegments (member_count = 2). The resolver must be hit once per
@@ -583,6 +590,60 @@ TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
     ASSERT_TRUE(plan) << plan.detail;
     ASSERT_EQ(plan.requests.size(), 8u);
     EXPECT_EQ(endpoints.resolves, 2);
+
+    // A second identical Plan hits SegmentLocationCache: no new resolver calls.
+    auto again = planner.Plan(replica, {{1000, 512}});
+    ASSERT_TRUE(again) << again.detail;
+    EXPECT_EQ(endpoints.resolves, 2);
+}
+
+TEST(VSegmentTransferPlannerTest, EraseByEndpointForcesResolve) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    SegmentLocationCache locations;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache,
+                                     &locations);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 0, 512};
+
+    ASSERT_TRUE(planner.Plan(replica, {{1000, 512}}));
+    EXPECT_EQ(endpoints.resolves, 2);
+
+    // Simulates a transfer failure on one holder: its endpoint is evicted, so
+    // the next Plan must ask the master again for that member.
+    locations.EraseByEndpoint("endpoint://segment-a");
+    ASSERT_TRUE(planner.Plan(replica, {{1000, 512}}));
+    EXPECT_EQ(endpoints.resolves, 3);
+}
+
+TEST(SegmentLocationCacheTest, EvictsOldestAtCapacity) {
+    SegmentLocationCache cache(2);
+    const PSegmentLocation location{"ep", 1};
+    cache.Insert("a", location);
+    cache.Insert("b", location);
+    cache.Insert("c", location);
+    EXPECT_EQ(cache.Size(), 2u);
+    PSegmentLocation out;
+    EXPECT_FALSE(cache.Find("a", &out));
+    EXPECT_TRUE(cache.Find("b", &out));
+    EXPECT_TRUE(cache.Find("c", &out));
+}
+
+TEST(SegmentLocationCacheTest, EraseByEndpointDropsOnlyMatchingEntries) {
+    SegmentLocationCache cache;
+    cache.Insert("a", {"ep-1", 1});
+    cache.Insert("b", {"ep-1", 2});
+    cache.Insert("c", {"ep-2", 3});
+    cache.EraseByEndpoint("ep-1");
+    PSegmentLocation out;
+    EXPECT_FALSE(cache.Find("a", &out));
+    EXPECT_FALSE(cache.Find("b", &out));
+    EXPECT_TRUE(cache.Find("c", &out));
+    EXPECT_EQ(cache.Size(), 1u);
 }
 
 TEST(VSegmentTransferPlannerTest, RejectsAbsoluteAddressOverflow) {
@@ -594,7 +655,9 @@ TEST(VSegmentTransferPlannerTest, RejectsAbsoluteAddressOverflow) {
     TestEndpointResolver endpoints;
     endpoints.base_address = std::numeric_limits<uint64_t>::max();
     VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    SegmentLocationCache locations;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache,
+                                     &locations);
     VSegmentDescriptor replica{"partition-1", "vs-1", 1, 8};
     EXPECT_EQ(planner.Plan(replica, {{1000, 8}}).error,
               ErrorCode::INVALID_PARAMS);

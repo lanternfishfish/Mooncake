@@ -53,6 +53,31 @@ class VSegmentViewCache {
     std::deque<std::string> insertion_order_;
 };
 
+// Process-wide cache of runtime psegment locations keyed by segment_id.
+// A segment_id is a freshly generated UUID per mount, and endpoint/base are
+// fixed for the lifetime of that id, so entries never need a TTL. Entries are
+// only dropped on capacity pressure or when a transfer failure names their
+// endpoint (see Client::ReportFailedEndpointsToMasters).
+class SegmentLocationCache {
+   public:
+    explicit SegmentLocationCache(size_t max_entries = 4096)
+        : max_entries_(std::max<size_t>(1, max_entries)) {}
+    bool Find(const std::string& segment_id,
+              PSegmentLocation* location) const;
+    void Insert(const std::string& segment_id,
+                const PSegmentLocation& location);
+    // Drops every entry served by `endpoint`. One endpoint (host:port) backs
+    // all segments mounted from the same holder, so this evicts all of them.
+    void EraseByEndpoint(const std::string& endpoint);
+    size_t Size() const;
+
+   private:
+    const size_t max_entries_;
+    mutable std::mutex mutex_;
+    std::unordered_map<std::string, PSegmentLocation> locations_;
+    std::deque<std::string> insertion_order_;
+};
+
 struct EndpointTransferSubRequest {
     TransferSubRequest transfer;
     std::string endpoint;
@@ -69,10 +94,12 @@ class VSegmentTransferPlanner {
    public:
     VSegmentTransferPlanner(VSegmentViewProvider* provider,
                             SegmentEndpointResolver* endpoint_resolver,
-                            VSegmentViewCache* cache)
+                            VSegmentViewCache* cache,
+                            SegmentLocationCache* location_cache)
         : provider_(provider),
           endpoint_resolver_(endpoint_resolver),
-          cache_(cache) {}
+          cache_(cache),
+          location_cache_(location_cache) {}
 
     VSegmentTransferPlan Plan(const VSegmentDescriptor& replica,
                               const std::vector<ClientSlice>& slices);
@@ -81,6 +108,7 @@ class VSegmentTransferPlanner {
     VSegmentViewProvider* provider_;
     SegmentEndpointResolver* endpoint_resolver_;
     VSegmentViewCache* cache_;
+    SegmentLocationCache* location_cache_;
 };
 
 }  // namespace mooncake::vsegment

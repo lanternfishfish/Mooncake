@@ -86,11 +86,53 @@ size_t VSegmentViewCache::Size() const {
     return views_.size();
 }
 
+bool SegmentLocationCache::Find(const std::string& segment_id,
+                                PSegmentLocation* location) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = locations_.find(segment_id);
+    if (found == locations_.end()) return false;
+    if (location) *location = found->second;
+    return true;
+}
+
+void SegmentLocationCache::Insert(const std::string& segment_id,
+                                  const PSegmentLocation& location) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (locations_.count(segment_id) != 0) return;
+    while (locations_.size() >= max_entries_ && !insertion_order_.empty()) {
+        const std::string oldest = insertion_order_.front();
+        insertion_order_.pop_front();
+        locations_.erase(oldest);
+    }
+    locations_.emplace(segment_id, location);
+    insertion_order_.push_back(segment_id);
+}
+
+void SegmentLocationCache::EraseByEndpoint(const std::string& endpoint) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = locations_.begin(); it != locations_.end();) {
+        if (it->second.endpoint != endpoint) {
+            ++it;
+            continue;
+        }
+        const std::string key = it->first;
+        it = locations_.erase(it);
+        insertion_order_.erase(
+            std::remove(insertion_order_.begin(), insertion_order_.end(), key),
+            insertion_order_.end());
+    }
+}
+
+size_t SegmentLocationCache::Size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return locations_.size();
+}
+
 VSegmentTransferPlan VSegmentTransferPlanner::Plan(
     const VSegmentDescriptor& replica,
     const std::vector<ClientSlice>& slices) {
     VSegmentTransferPlan plan;
-    if (!provider_ || !endpoint_resolver_ || !cache_ ||
+    if (!provider_ || !endpoint_resolver_ || !cache_ || !location_cache_ ||
         replica.partition_id.empty() || replica.vsegment_id.empty() ||
         replica.length == 0) {
         plan.error = ErrorCode::INVALID_PARAMS;
@@ -125,21 +167,26 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
     // is bounded by member_count, so with a small stripe this loop used to
     // issue dozens of identical GetPSegmentEndpoint RPCs for the same three
     // answers (e.g. 128 calls for a 512 KiB object with member_count = 3).
-    // The cache is local to this call: no lifetime or invalidation concerns.
+    // The map below dedups within one Plan; SegmentLocationCache dedups across
+    // Plans, so a segment is resolved over the network only once per client.
     std::unordered_map<std::string, PSegmentLocation> endpoints;
     for (auto& request : resolved.requests) {
         auto [entry, inserted] = endpoints.try_emplace(request.segment_id);
         if (inserted) {
-            auto result = endpoint_resolver_->ResolveLocation(
-                request.segment_id, &entry->second);
-            if (result != ErrorCode::OK || entry->second.endpoint.empty()) {
-                plan.error = result == ErrorCode::OK
-                                 ? ErrorCode::SEGMENT_NOT_FOUND
-                                 : result;
-                plan.detail =
-                    "cannot resolve endpoint for " + request.segment_id;
-                plan.requests.clear();
-                return plan;
+            if (!location_cache_->Find(request.segment_id, &entry->second)) {
+                auto result = endpoint_resolver_->ResolveLocation(
+                    request.segment_id, &entry->second);
+                if (result != ErrorCode::OK ||
+                    entry->second.endpoint.empty()) {
+                    plan.error = result == ErrorCode::OK
+                                     ? ErrorCode::SEGMENT_NOT_FOUND
+                                     : result;
+                    plan.detail =
+                        "cannot resolve endpoint for " + request.segment_id;
+                    plan.requests.clear();
+                    return plan;
+                }
+                location_cache_->Insert(request.segment_id, entry->second);
             }
         }
         const PSegmentLocation& location = entry->second;

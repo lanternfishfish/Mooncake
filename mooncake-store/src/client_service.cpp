@@ -1288,10 +1288,12 @@ void Client::InitTransferSubmitter() {
     vsegment_endpoint_resolver_ =
         std::make_unique<MasterClientSegmentEndpointResolver>(&master_client_);
     vsegment_view_cache_ = std::make_unique<vsegment::VSegmentViewCache>();
+    vsegment_endpoint_cache_ =
+        std::make_shared<vsegment::SegmentLocationCache>();
     vsegment_transfer_planner_ =
         std::make_shared<vsegment::VSegmentTransferPlanner>(
             vsegment_view_provider_.get(), vsegment_endpoint_resolver_.get(),
-            vsegment_view_cache_.get());
+            vsegment_view_cache_.get(), vsegment_endpoint_cache_.get());
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -2242,6 +2244,14 @@ void Client::ReportFailedEndpointsToMasters(
     const std::set<std::string>& failed_endpoints) {
     if (failed_endpoints.empty()) {
         return;
+    }
+    // Drop cached psegment locations served by the failed endpoints first, so
+    // the next transfer falls back to GetPSegmentEndpoint and observes the
+    // master's verdict (e.g. SEGMENT_NOT_FOUND) instead of a stale address.
+    if (vsegment_endpoint_cache_) {
+        for (const auto& endpoint : failed_endpoints) {
+            vsegment_endpoint_cache_->EraseByEndpoint(endpoint);
+        }
     }
     const std::vector<std::string> invalid_endpoints(
         failed_endpoints.begin(), failed_endpoints.end());
