@@ -7201,18 +7201,6 @@ auto MasterService::GetReplicaList(const std::string& key,
     return GetReplicaListLocal(object_id);
 }
 
-namespace {
-bool VSegmentInlineLayoutEnabled() {
-    const char* env = std::getenv("MC_VSEGMENT_INLINE_LAYOUT");
-    if (env == nullptr) return true;
-    std::string value(env);
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return !(value == "0" || value == "false" || value == "no" ||
-             value == "off");
-}
-}  // namespace
-
 void MasterService::InvalidateVSegmentLayoutCache() {
     std::lock_guard<std::mutex> lock(vsegment_layout_cache_mutex_);
     vsegment_layout_cache_.clear();
@@ -7221,7 +7209,6 @@ void MasterService::InvalidateVSegmentLayoutCache() {
 std::vector<VSegmentLayoutEntry> MasterService::BuildVSegmentLayoutTable(
     const std::vector<std::pair<std::string, std::string>>& vsegments) {
     std::vector<VSegmentLayoutEntry> result;
-    if (!VSegmentInlineLayoutEnabled()) return result;
 
     // 锁序：本函数在 GetReplicaListLocal/ForAdmin 的末尾被调用，此时
     // snapshot_mutex_（共享）仍被持有；而 vsegment 首建线程持有
