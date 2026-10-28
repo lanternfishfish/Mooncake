@@ -216,8 +216,7 @@ TEST(VSegmentLayoutWireTest, BatchVectorCarriesTableOnFirstResponse) {
     batch.push_back(GetReplicaListResponse{});
     AttachVSegmentLayoutTableToFirstSuccess(
         batch, {MakeTestLayoutEntry()});
-    ASSERT_TRUE(batch[0]);
-    EXPECT_FALSE(batch[0]->vsegment_layouts.has_value());
+    EXPECT_FALSE(batch[0].has_value());
     ASSERT_TRUE(batch[1]->vsegment_layouts.has_value());
     EXPECT_FALSE(batch[2]->vsegment_layouts.has_value());
 
