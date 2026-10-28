@@ -2332,6 +2332,60 @@ TEST(VSegmentLayoutMasterTest, UnmountInvalidatesCachedLayouts) {
     EXPECT_TRUE(after.empty());
 }
 
+TEST(VSegmentLayoutMasterTest, FeatureFlagDisablesTableBuilding) {
+    const std::string partition_id = "partition-layout-flag";
+    const UUID segment_a = generate_uuid();
+    const UUID segment_b = generate_uuid();
+
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {{partition_id,
+                     "default",
+                     "DRAM",
+                     {{UuidToString(segment_a), 0, 512},
+                      {UuidToString(segment_b), 0, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = vsegments->StartPut(partition_id, 1, "layout-flag", 64);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+
+    MasterServiceConfig config;
+    MasterService master(config);
+    master.SetVSegmentService(vsegments);
+    const UUID client = generate_uuid();
+    Segment mounted_a;
+    mounted_a.id = segment_a;
+    mounted_a.name = "flag-seg-a";
+    mounted_a.base = 0x400000;
+    mounted_a.size = 1 << 20;
+    mounted_a.te_endpoint = "10.0.0.1:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_a, client).has_value());
+    Segment mounted_b;
+    mounted_b.id = segment_b;
+    mounted_b.name = "flag-seg-b";
+    mounted_b.base = 0x500000;
+    mounted_b.size = 1 << 20;
+    mounted_b.te_endpoint = "10.0.0.2:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_b, client).has_value());
+
+    const std::vector<std::pair<std::string, std::string>> vsegments_input = {
+        {partition_id, started.replica.vsegment_id}};
+    ASSERT_EQ(setenv("MC_VSEGMENT_INLINE_LAYOUT", "0", 1), 0);
+    EXPECT_TRUE(master.BuildVSegmentLayoutTable(vsegments_input).empty());
+    ASSERT_EQ(setenv("MC_VSEGMENT_INLINE_LAYOUT", "1", 1), 0);
+    EXPECT_EQ(master.BuildVSegmentLayoutTable(vsegments_input).size(), 1u);
+    unsetenv("MC_VSEGMENT_INLINE_LAYOUT");
+}
+
 TEST(VSegmentIntegrationTest, OrdinaryMemoryRevokeRemovesVSegmentReplica) {
     const std::string key = "ordinary-vsegment-revoke";
     const auto& tenant = TenantId::Default();
