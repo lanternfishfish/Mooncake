@@ -1,6 +1,7 @@
 #include "vsegment/vsegment.h"
 #include "vsegment/vsegment_runtime.h"
 #include "vsegment/vsegment_transfer.h"
+#include "vsegment/vsegment_route.h"
 #include "cvm/cvm_keys.h"
 #include "cvm/etcd_view_store.h"
 #include "vsegment/vsegment_ha.h"
@@ -2430,6 +2431,173 @@ TEST(BuildDiscoveredQuotaPlanTest, AutoMediumModeSkipsInsufficientMedium) {
     ASSERT_EQ(request.profile_specs.size(), 1u);
     EXPECT_EQ(request.profile_specs[0].required_medium, "NVMe");
     EXPECT_EQ(request.default_profile, "default-NVMe");
+}
+
+// ============================================================================
+// L1：入口内联 route 的构建（vsegment/vsegment_route.h，fork 独有纯函数）
+// ============================================================================
+
+class VSegmentRouteBuilderTest : public ::testing::Test {
+   protected:
+    static VSegmentView MakeView(const std::string& partition_id,
+                                 const std::string& vsegment_id,
+                                 const std::vector<std::string>& segments) {
+        VSegmentView view;
+        view.partition_id = partition_id;
+        view.vsegment_id = vsegment_id;
+        view.stripe_size = 512 * 1024;
+        uint64_t offset = 0;
+        for (const auto& segment_id : segments) {
+            view.members.push_back(PSegmentExtent{segment_id, offset, 1 << 20});
+            offset += (1 << 20);
+        }
+        view.logical_capacity = offset;
+        return view;
+    }
+
+    static std::vector<Replica::Descriptor> Replicas(
+        const std::string& partition_id, const std::string& vsegment_id,
+        size_t count) {
+        std::vector<Replica::Descriptor> replicas;
+        replicas.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            Replica replica(
+                VSegmentDescriptor{partition_id, vsegment_id, i * 1024, 1024},
+                ReplicaStatus::COMPLETE);
+            EXPECT_TRUE(replica.is_vsegment_replica());
+            replicas.push_back(replica.get_descriptor());
+        }
+        return replicas;
+    }
+};
+
+TEST_F(VSegmentRouteBuilderTest, IgnoresNonVsegmentReplicas) {
+    std::vector<Replica::Descriptor> replicas(1);
+    ASSERT_FALSE(replicas.front().is_vsegment_replica());
+
+    auto routes = BuildVSegmentRoutes(
+        replicas,
+        [](const std::string&, const std::string&, VSegmentView*) {
+            ADD_FAILURE() << "load_view must not be called for non-vsegment";
+            return ErrorCode::OK;
+        },
+        [](const std::string&, std::string*, uint64_t*) {
+            ADD_FAILURE() << "resolve_endpoint must not be called";
+            return true;
+        });
+    ASSERT_TRUE(routes.has_value());
+    EXPECT_TRUE(routes->empty());
+}
+
+TEST_F(VSegmentRouteBuilderTest, BuildsOneRoutePerVSegmentAndKeepsMemberOrder) {
+    const auto replicas = Replicas("p-1", "vs-1", 2);
+    const auto view = MakeView("p-1", "vs-1", {"seg-a", "seg-b"});
+    size_t load_calls = 0;
+
+    auto routes = BuildVSegmentRoutes(
+        replicas,
+        [&](const std::string& partition_id, const std::string& vsegment_id,
+            VSegmentView* out) {
+            ++load_calls;
+            EXPECT_EQ(partition_id, "p-1");
+            EXPECT_EQ(vsegment_id, "vs-1");
+            *out = view;
+            return ErrorCode::OK;
+        },
+        [](const std::string& segment_id, std::string* endpoint,
+           uint64_t* base_address) {
+            *endpoint = "ep-" + segment_id;
+            *base_address = 4096;
+            return true;
+        });
+
+    ASSERT_TRUE(routes.has_value());
+    EXPECT_EQ(load_calls, 1u);  // 两个副本同一 vsegment → 只加载一次
+    ASSERT_EQ(routes->size(), 1u);
+    const auto& route = routes->front();
+    EXPECT_EQ(route.view.partition_id, "p-1");
+    EXPECT_EQ(route.view.vsegment_id, "vs-1");
+    ASSERT_EQ(route.locations.size(), 2u);
+    EXPECT_EQ(route.locations[0].segment_id, "seg-a");
+    EXPECT_EQ(route.locations[0].endpoint, "ep-seg-a");
+    EXPECT_EQ(route.locations[0].base_address, 4096u);
+    EXPECT_EQ(route.locations[1].segment_id, "seg-b");
+}
+
+TEST_F(VSegmentRouteBuilderTest, MissingMemberFailsWholeRoute) {
+    const auto replicas = Replicas("p-1", "vs-1", 1);
+    const auto view = MakeView("p-1", "vs-1", {"seg-a", "seg-b"});
+
+    auto routes = BuildVSegmentRoutes(
+        replicas,
+        [&](const std::string&, const std::string&, VSegmentView* out) {
+            *out = view;
+            return ErrorCode::OK;
+        },
+        [](const std::string& segment_id, std::string* endpoint,
+           uint64_t* base_address) {
+            if (segment_id == "seg-b") return false;  // 成员缺失
+            *endpoint = "ep-" + segment_id;
+            *base_address = 0;
+            return true;
+        });
+
+    ASSERT_FALSE(routes.has_value());
+    EXPECT_EQ(routes.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+TEST_F(VSegmentRouteBuilderTest, EmptyEndpointFailsWholeRoute) {
+    const auto replicas = Replicas("p-1", "vs-1", 1);
+    const auto view = MakeView("p-1", "vs-1", {"seg-a"});
+
+    auto routes = BuildVSegmentRoutes(
+        replicas,
+        [&](const std::string&, const std::string&, VSegmentView* out) {
+            *out = view;
+            return ErrorCode::OK;
+        },
+        [](const std::string&, std::string* endpoint, uint64_t* base_address) {
+            endpoint->clear();
+            *base_address = 0;
+            return true;
+        });
+
+    ASSERT_FALSE(routes.has_value());
+    EXPECT_EQ(routes.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+TEST_F(VSegmentRouteBuilderTest, ViewIdentityMismatchFails) {
+    const auto replicas = Replicas("p-1", "vs-1", 1);
+    const auto view = MakeView("p-2", "vs-1", {"seg-a"});  // partition 不符
+
+    auto routes = BuildVSegmentRoutes(
+        replicas,
+        [&](const std::string&, const std::string&, VSegmentView* out) {
+            *out = view;
+            return ErrorCode::OK;
+        },
+        [](const std::string&, std::string* endpoint, uint64_t* base_address) {
+            *endpoint = "ep";
+            *base_address = 0;
+            return true;
+        });
+
+    ASSERT_FALSE(routes.has_value());
+    EXPECT_EQ(routes.error(), ErrorCode::INVALID_VERSION);
+}
+
+TEST_F(VSegmentRouteBuilderTest, LoadViewErrorPropagates) {
+    const auto replicas = Replicas("p-1", "vs-1", 1);
+
+    auto routes = BuildVSegmentRoutes(
+        replicas,
+        [](const std::string&, const std::string&, VSegmentView*) {
+            return ErrorCode::STALE_ROUTE;
+        },
+        [](const std::string&, std::string*, uint64_t*) { return true; });
+
+    ASSERT_FALSE(routes.has_value());
+    EXPECT_EQ(routes.error(), ErrorCode::STALE_ROUTE);
 }
 
 }  // namespace
