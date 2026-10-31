@@ -1435,10 +1435,11 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
         auto routes = master_service_.BuildVSegmentRoutesForResponse(replicas);
         if (!routes) {
             WithWriteTenant(tenant_id, master_service_.IsTenantQuotaEnabled(),
-                            [&](const TenantId& resolved_tenant_id) {
+                            [&](const TenantId& resolved_tenant_id)
+                                -> tl::expected<void, ErrorCode> {
                                 master_service_.CopyRevoke(
                                     client_id, key, resolved_tenant_id);
-                                return ErrorCode::OK;
+                                return {};
                             });
             return tl::make_unexpected(routes.error());
         }
@@ -1525,10 +1526,11 @@ tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
         auto routes = master_service_.BuildVSegmentRoutesForResponse(replicas);
         if (!routes) {
             WithWriteTenant(tenant_id, master_service_.IsTenantQuotaEnabled(),
-                            [&](const TenantId& resolved_tenant_id) {
+                            [&](const TenantId& resolved_tenant_id)
+                                -> tl::expected<void, ErrorCode> {
                                 master_service_.MoveRevoke(
                                     client_id, key, resolved_tenant_id);
-                                return ErrorCode::OK;
+                                return {};
                             });
             return tl::make_unexpected(routes.error());
         }
