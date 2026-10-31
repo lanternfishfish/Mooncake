@@ -1708,7 +1708,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    err = TransferRead(replica, slices, &query_result.vsegment_routes);
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
@@ -1789,7 +1789,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferReadRange(replica, slices, src_offset);
+    err = TransferReadRange(replica, slices, src_offset,
+                            &query_result.vsegment_routes);
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -2362,8 +2363,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                       : replica.is_vsegment_replica()
                                           ? ReplicaType::MEMORY
                                           : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err =
-                TransferWrite(replica, slices, &failed_endpoints);
+            ErrorCode transfer_err = TransferWrite(
+                replica, slices, &failed_endpoints, &put_start.vsegment_routes);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
                 if (replica.is_memory_replica()) {
@@ -2497,8 +2498,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     // Transfer to memory-class replicas (direct memory or vsegment).
     for (const auto& replica : upsert_start.replicas) {
         if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
-            ErrorCode transfer_err =
-                TransferWrite(replica, slices, &failed_endpoints);
+            ErrorCode transfer_err = TransferWrite(
+                replica, slices, &failed_endpoints,
+                &upsert_start.vsegment_routes);
             if (transfer_err != ErrorCode::OK) {
                 if (replica.is_memory_replica()) {
                     failed_endpoints.insert(replica.get_memory_descriptor()
@@ -4718,7 +4720,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
-    const std::vector<Replica::Descriptor>& targets) {
+    const std::vector<Replica::Descriptor>& targets,
+    const std::vector<vsegment::VSegmentRoute>* vsegment_routes) {
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -4769,7 +4772,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
             return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         slices = split_into_slices(*staging);
-        if (TransferRead(source, slices) != ErrorCode::OK) {
+        if (TransferRead(source, slices, vsegment_routes) != ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -4777,7 +4780,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
+        if (TransferWrite(target, slices, nullptr, vsegment_routes) !=
+            ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -4834,7 +4838,7 @@ tl::expected<void, ErrorCode> Client::Copy(
     auto result = ExecuteReplicaTransfer(
         key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
         [&]() { return master_client_.CopyRevoke(key, tenant_id); },
-        response.source, response.targets);
+        response.source, response.targets, &response.vsegment_routes);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -4889,7 +4893,7 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     auto result = ExecuteReplicaTransfer(
         key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
         [&]() { return master_client_.MoveRevoke(key, tenant_id); },
-        response.source, targets);
+        response.source, targets, &response.vsegment_routes);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key
@@ -5047,7 +5051,9 @@ void Client::PutToLocalFile(const std::string& key,
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
                                TransferRequest::OpCode op_code,
-                               std::set<std::string>* failed_endpoints) {
+                               std::set<std::string>* failed_endpoints,
+                               const std::vector<vsegment::VSegmentRoute>*
+                                   vsegment_routes) {
     // TransferData 读写共函数：仅读路径（op_code==READ）计入 GET_SINGLE_
     // TRANSFER_* 键，写路径 PUT_* 键待后续批次，避免读写流量互相污染。
     // SUBMIT/WAIT 拆分用于区分 RDMA 提交阻塞与传输等待。
@@ -5089,8 +5095,31 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         SpDiag::PerfPoint pt_plan(PerfKey::VSEGMENT_READ_PLAN,
                                   SpDiag::PerfLevel::MODULE);
         if (is_read) pt_plan.Start();
-        auto plan = vsegment_transfer_planner_->Plan(
-            replica_descriptor.get_vsegment_descriptor(), client_slices);
+        const auto vsegment_descriptor =
+            replica_descriptor.get_vsegment_descriptor();
+        // L1：route 必须来自入口 RPC 响应（(partition, vsegment) 精确匹配）。
+        const vsegment::VSegmentRoute* inline_route = nullptr;
+        if (vsegment_routes != nullptr) {
+            for (const auto& candidate : *vsegment_routes) {
+                if (candidate.view.partition_id ==
+                        vsegment_descriptor.partition_id &&
+                    candidate.view.vsegment_id ==
+                        vsegment_descriptor.vsegment_id) {
+                    inline_route = &candidate;
+                    break;
+                }
+            }
+        }
+        if (inline_route == nullptr) {
+            LOG(ERROR) << "vsegment route missing from entry RPC response: "
+                       << "partition=" << vsegment_descriptor.partition_id
+                       << ", vsegment=" << vsegment_descriptor.vsegment_id;
+            if (is_read) pt_plan.End(-1);
+            if (is_read) pt_full.End(-1);
+            return ErrorCode::INVALID_VERSION;
+        }
+        auto plan = vsegment_transfer_planner_->PlanWithRoute(
+            vsegment_descriptor, client_slices, *inline_route);
         if (is_read) {
             pt_plan.End(plan ? 0 : -1);
             if (mooncake::logging::ShouldSampleHiFreqLog()) {
@@ -5164,7 +5193,8 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::TransferReadInternal(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset,
+    const std::vector<vsegment::VSegmentRoute>* vsegment_routes) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
@@ -5190,7 +5220,25 @@ ErrorCode Client::TransferReadInternal(
             return ErrorCode::INVALID_PARAMS;
         replica.logical_offset += src_offset;
         replica.length = length;
-        auto plan = vsegment_transfer_planner_->Plan(replica, client_slices);
+        // L1：range read 同样只能消费入口 RPC 内联的 route。
+        const vsegment::VSegmentRoute* inline_route = nullptr;
+        if (vsegment_routes != nullptr) {
+            for (const auto& candidate : *vsegment_routes) {
+                if (candidate.view.partition_id == replica.partition_id &&
+                    candidate.view.vsegment_id == replica.vsegment_id) {
+                    inline_route = &candidate;
+                    break;
+                }
+            }
+        }
+        if (inline_route == nullptr) {
+            LOG(ERROR) << "vsegment route missing from entry RPC response "
+                       << "(range read): partition=" << replica.partition_id
+                       << ", vsegment=" << replica.vsegment_id;
+            return ErrorCode::INVALID_VERSION;
+        }
+        auto plan = vsegment_transfer_planner_->PlanWithRoute(
+            replica, client_slices, *inline_route);
         if (!plan) return plan.error;
         auto future = transfer_submitter_->submitVSegment(
             plan, TransferRequest::READ);
@@ -5211,13 +5259,17 @@ ErrorCode Client::TransferReadInternal(
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
-                                std::set<std::string>* failed_endpoints) {
+                                std::set<std::string>* failed_endpoints,
+                                const std::vector<vsegment::VSegmentRoute>*
+                                    vsegment_routes) {
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE,
-                        failed_endpoints);
+                        failed_endpoints, vsegment_routes);
 }
 
-ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices) {
+ErrorCode Client::TransferRead(
+    const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices,
+    const std::vector<vsegment::VSegmentRoute>* vsegment_routes) {
     // 读传输整窗（size 校验 + TransferData 读分支）；内部 GET_SINGLE_
     // TRANSFER_FULL 为其子窗，差值即校验开销
     SpDiag::PerfPoint pt_read(PerfKey::GET_SINGLE_TRANSFER_READ,
@@ -5248,16 +5300,19 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    const ErrorCode read_result =
-        TransferData(replica_descriptor, slices, TransferRequest::READ);
+    const ErrorCode read_result = TransferData(
+        replica_descriptor, slices, TransferRequest::READ, nullptr,
+        vsegment_routes);
     pt_read.End(read_result == ErrorCode::OK ? 0 : -1);
     return read_result;
 }
 
 ErrorCode Client::TransferReadRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
-    uint64_t src_offset) {
-    return TransferReadInternal(replica_descriptor, slices, src_offset);
+    uint64_t src_offset,
+    const std::vector<vsegment::VSegmentRoute>* vsegment_routes) {
+    return TransferReadInternal(replica_descriptor, slices, src_offset,
+                                vsegment_routes);
 }
 
 void Client::PollAndDispatchTasks() {

@@ -46,13 +46,18 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    // 入口 RPC 内联下发的 vsegment 路由（按 vsegment 去重）；非 vsegment 副本为空。
+    // 传输层直接用它建计划，不再发 GetVSegmentView / GetPSegmentEndpoint。
+    const std::vector<vsegment::VSegmentRoute> vsegment_routes;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
+                std::optional<uint64_t> object_checksum_param = std::nullopt,
+                std::vector<vsegment::VSegmentRoute> vsegment_routes_param = {})
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          vsegment_routes(std::move(vsegment_routes_param)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -849,25 +854,35 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
+    // vsegment_routes：入口 RPC 响应内联下发的 route（可为 nullptr）。vsegment
+    // 副本必须命中 route，否则整单失败（不回退到 GetVSegmentView/Endpoint）。
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code,
-                           std::set<std::string>* failed_endpoints = nullptr);
+                           std::set<std::string>* failed_endpoints = nullptr,
+                           const std::vector<vsegment::VSegmentRoute>*
+                               vsegment_routes = nullptr);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t src_offset);
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<vsegment::VSegmentRoute>* vsegment_routes = nullptr);
     // failed_endpoints：vsegment 传输失败归因用。vsegment 副本 Descriptor 仅含
     // 逻辑位置，物理端点在传输 plan 中解析；失败时 best-effort 上报 plan 中
     // 全部条带成员端点（无法定位具体失败成员，误报由 worker 重挂载时
     // MountSegment 的 erase 自愈兜底）。非 vsegment 副本不填充。
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices,
-                            std::set<std::string>* failed_endpoints = nullptr);
-    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
-    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices,
-                                uint64_t src_offset);
+                            std::set<std::string>* failed_endpoints = nullptr,
+                            const std::vector<vsegment::VSegmentRoute>*
+                                vsegment_routes = nullptr);
+    ErrorCode TransferRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        const std::vector<vsegment::VSegmentRoute>* vsegment_routes = nullptr);
+    ErrorCode TransferReadRange(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<vsegment::VSegmentRoute>* vsegment_routes = nullptr);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -1119,7 +1134,8 @@ class Client {
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets,
+        const std::vector<vsegment::VSegmentRoute>* vsegment_routes = nullptr);
 
     /**
      * @brief Copy an object's replica to target segments
