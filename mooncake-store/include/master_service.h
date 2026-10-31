@@ -212,6 +212,11 @@ class MasterService {
     void FlushStaleEvictQueueForTesting();
     tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
         const std::string& partition_id, const std::string& vsegment_id);
+    // 为一组副本构建随入口 RPC 响应下发的 vsegment route（L1）。逻辑主体在
+    // vsegment/vsegment_route.cpp；供 WrappedMasterService 在 RPC 边界调用。
+    tl::expected<std::vector<vsegment::VSegmentRoute>, ErrorCode>
+    BuildVSegmentRoutesForResponse(
+        const std::vector<Replica::Descriptor>& replicas);
     tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
         const std::string& segment_id);
     vsegment::VSegmentPutStartResult VSegmentPutStart(
@@ -2850,10 +2855,6 @@ class MasterService {
     // 物理段运行时位置；与 GetPSegmentEndpoint 共用同一份查表语义。
     bool ResolvePSegmentLocation(const std::string& segment_id,
                                  vsegment::PSegmentLocation* location);
-    // 为一组副本构建随响应下发的 route（按 vsegment 去重；缺成员即失败）。
-    tl::expected<std::vector<vsegment::VSegmentRoute>, ErrorCode>
-    BuildVSegmentRoutesForResponse(
-        const std::vector<Replica::Descriptor>& replicas);
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size

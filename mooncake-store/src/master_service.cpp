@@ -1052,15 +1052,6 @@ MasterService::TryVSegmentPutStart(
     std::vector<Replica::Descriptor> descriptors;
     for (const auto& replica : replicas)
         descriptors.push_back(replica.get_descriptor());
-    // 路由内联：在写入 metadata / processing 状态**之前**把 route 建好。
-    // 失败时只需撤销逻辑预留 + 配额（此时尚无对象元数据残留），不存在
-    // 「已扣配额、已插元数据」的中间态。
-    auto routes = BuildVSegmentRoutesForResponse(descriptors);
-    if (!routes) {
-        abort();
-        AbortTenantQuota(*normalized, quota_charge);
-        return tl::make_unexpected(routes.error());
-    }
     const std::string group_id =
         config.group_ids && !config.group_ids->empty()
             ? config.group_ids->front()
@@ -1080,12 +1071,10 @@ MasterService::TryVSegmentPutStart(
     it->second.reserved_quota_charge_bytes = quota_charge;
     RegisterGroupMember(tenant_state, *normalized, key, group_id);
     tenant_state.processing_keys.insert(key);
-    PutStartResult start_result{operation_ids.size() == 1
-                                    ? operation_ids.front()
-                                    : std::string{},
-                                std::move(descriptors)};
-    start_result.vsegment_routes = std::move(*routes);
-    return std::optional<PutStartResult>(std::move(start_result));
+    return std::optional<PutStartResult>(
+        PutStartResult{operation_ids.size() == 1 ? operation_ids.front()
+                                                : std::string{},
+                       std::move(descriptors)});
 }
 
 void MasterService::KickSlotHeartbeat() {
@@ -7569,11 +7558,6 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     // }
     (void)record_io_access;
     (void)io_access;
-    // 路由内联：读响应直接携带 vsegment route；建 route 失败即整单失败
-    //（绝不返回「有 descriptor 但没有 route」的响应）。
-    auto routes = BuildVSegmentRoutesForResponse(resp.replicas);
-    if (!routes) return tl::make_unexpected(routes.error());
-    resp.vsegment_routes = std::move(*routes);
     pt_total.End(0);
     return resp;
 }
@@ -7824,20 +7808,9 @@ MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
                     }
                 }
 
-                auto batch_response = GetReplicaListResponse(
+                results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
                     metadata.object_checksum);
-                // 路由内联：批量读同样携带 route（当前为逐 key 构建；跨 key 去重
-                // 留给批次级容器 BatchGetReplicaListResponse 的后续切换）。
-                auto batch_routes =
-                    BuildVSegmentRoutesForResponse(batch_response.replicas);
-                if (!batch_routes) {
-                    results[original_idx] =
-                        tl::make_unexpected(batch_routes.error());
-                    continue;
-                }
-                batch_response.vsegment_routes = std::move(*batch_routes);
-                results[original_idx] = std::move(batch_response);
                 io_accesses.push_back(
                     {.object = {normalized_tenant, key},
                      .observed_at_ns = static_cast<uint64_t>(
@@ -7964,18 +7937,9 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                     continue;
                 }
 
-                auto batch_response = GetReplicaListResponse(
+                results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
                     metadata.object_checksum);
-                auto batch_routes =
-                    BuildVSegmentRoutesForResponse(batch_response.replicas);
-                if (!batch_routes) {
-                    results[original_idx] =
-                        tl::make_unexpected(batch_routes.error());
-                    continue;
-                }
-                batch_response.vsegment_routes = std::move(*batch_routes);
-                results[original_idx] = std::move(batch_response);
             }
         }
     }

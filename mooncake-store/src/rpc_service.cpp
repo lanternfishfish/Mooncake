@@ -314,6 +314,14 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
         });
+    // 路由内联（L1）：读响应在 RPC 边界挂 route；建不出来即整单失败
+    //（不返回「有 descriptor 但没有 route」的响应，客户端也不回退旧 RPC）。
+    if (result) {
+        auto routes = master_service_.BuildVSegmentRoutesForResponse(
+            result->replicas);
+        if (!routes) return tl::make_unexpected(routes.error());
+        result->vsegment_routes = std::move(*routes);
+    }
     if (sample) {
         const auto latency_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -471,6 +479,19 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         pt_convert.End(0);
     }
 
+    // 路由内联（L1）：批量读在 RPC 边界逐 key 挂 route；建不出来该 key 即失败。
+    //（跨 key 去重待批次级容器 BatchGetReplicaListResponse 切换后再做。）
+    for (auto& item : results) {
+        if (!item) continue;
+        auto routes =
+            master_service_.BuildVSegmentRoutesForResponse(item->replicas);
+        if (!routes) {
+            item = tl::make_unexpected(routes.error());
+            continue;
+        }
+        item->vsegment_routes = std::move(*routes);
+    }
+
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
@@ -570,7 +591,29 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                         client_id, key, resolved_tenant_id, slice_length,
                         config);
                     if (!vsegment) return tl::make_unexpected(vsegment.error());
-                    if (vsegment->has_value()) return std::move(**vsegment);
+                    if (vsegment->has_value()) {
+                        PutStartResult started = std::move(**vsegment);
+                        // 路由内联（L1）：在 RPC 边界构建 route；建不出来就整单失败，
+                        // 并按完整 PutRevoke 语义回收（预留/配额/元数据/processing）。
+                        auto routes =
+                            master_service_.BuildVSegmentRoutesForResponse(
+                                started.replicas);
+                        if (!routes) {
+                            auto revoked = master_service_.PutRevoke(
+                                client_id, key, resolved_tenant_id,
+                                ReplicaType::MEMORY, started.operation_id);
+                            if (!revoked) {
+                                LOG(ERROR)
+                                    << "PutStart route build failed and revoke "
+                                       "failed: key="
+                                    << key
+                                    << " error=" << toString(revoked.error());
+                            }
+                            return tl::make_unexpected(routes.error());
+                        }
+                        started.vsegment_routes = std::move(*routes);
+                        return started;
+                    }
                     auto descriptors = master_service_.PutStart(
                         client_id, key, resolved_tenant_id, slice_length,
                         config);
@@ -1361,7 +1404,7 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "CopyStart",
         PerfKey::MASTER_RPC_COPY_START,
         [&] {
@@ -1381,6 +1424,27 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
         },
         [] { MasterMetricManager::instance().inc_copy_start_requests(); },
         [] { MasterMetricManager::instance().inc_copy_start_failures(); });
+    // 路由内联（L1）：vsegment 源/目标都要随响应下发；建不出来即整单失败并
+    // 走完整 CopyRevoke 回收（任务/目标预留/元数据）。
+    if (result) {
+        std::vector<Replica::Descriptor> replicas;
+        replicas.reserve(1 + result->targets.size());
+        replicas.push_back(result->source);
+        replicas.insert(replicas.end(), result->targets.begin(),
+                        result->targets.end());
+        auto routes = master_service_.BuildVSegmentRoutesForResponse(replicas);
+        if (!routes) {
+            WithWriteTenant(tenant_id, master_service_.IsTenantQuotaEnabled(),
+                            [&](const TenantId& resolved_tenant_id) {
+                                master_service_.CopyRevoke(
+                                    client_id, key, resolved_tenant_id);
+                                return ErrorCode::OK;
+                            });
+            return tl::make_unexpected(routes.error());
+        }
+        result->vsegment_routes = std::move(*routes);
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
@@ -1434,7 +1498,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment, const std::string& tgt_segment) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "MoveStart",
         [&] {
             return WithWriteTenant(tenant_id,
@@ -1453,6 +1517,24 @@ tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
         },
         [] { MasterMetricManager::instance().inc_move_start_requests(); },
         [] { MasterMetricManager::instance().inc_move_start_failures(); });
+    // 路由内联（L1）：同 CopyStart；失败走完整 MoveRevoke 回收。
+    if (result) {
+        std::vector<Replica::Descriptor> replicas;
+        replicas.push_back(result->source);
+        if (result->target) replicas.push_back(*result->target);
+        auto routes = master_service_.BuildVSegmentRoutesForResponse(replicas);
+        if (!routes) {
+            WithWriteTenant(tenant_id, master_service_.IsTenantQuotaEnabled(),
+                            [&](const TenantId& resolved_tenant_id) {
+                                master_service_.MoveRevoke(
+                                    client_id, key, resolved_tenant_id);
+                                return ErrorCode::OK;
+                            });
+            return tl::make_unexpected(routes.error());
+        }
+        result->vsegment_routes = std::move(*routes);
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
