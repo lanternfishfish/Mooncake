@@ -47,7 +47,7 @@ class QueryResult {
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
     // 入口 RPC 内联下发的 vsegment 路由（按 vsegment 去重）；非 vsegment 副本为空。
-    // 传输层直接用它建计划，不再发 GetVSegmentView / GetPSegmentEndpoint。
+    // 传输层直接用它建计划；旧的 view/endpoint 解析 RPC 已删除。
     const std::vector<vsegment::VSegmentRoute> vsegment_routes;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
@@ -855,7 +855,7 @@ class Client {
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
     // vsegment_routes：入口 RPC 响应内联下发的 route（可为 nullptr）。vsegment
-    // 副本必须命中 route，否则整单失败（不回退到 GetVSegmentView/Endpoint）。
+    // 副本必须命中 route，否则整单失败（旧解析 RPC 已删除，无回退路径）。
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code,
@@ -999,10 +999,6 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
-    std::unique_ptr<vsegment::VSegmentViewProvider> vsegment_view_provider_;
-    std::unique_ptr<vsegment::SegmentEndpointResolver>
-        vsegment_endpoint_resolver_;
-    std::unique_ptr<vsegment::VSegmentViewCache> vsegment_view_cache_;
     std::shared_ptr<vsegment::VSegmentTransferPlanner>
         vsegment_transfer_planner_;
     // Registered client memory used when Copy/Move reads a non-local source

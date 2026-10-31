@@ -289,8 +289,6 @@ PERF_KEY_DEF(GET_SSD_LEASE_EXPIRED,   "real_client.cpp::batch_get_into_offload_o
 // PromotionEnqueue: 读命中仅 LOCAL_DISK 副本时的 promotion 异步入队（master 侧）
 PERF_KEY_DEF(GET_PROMOTION_ENQUEUE,   "master_service.cpp::TryPushPromotionQueue", "PromotionEnqueue")
 // === vsegment 观测（master RPC + client 翻译层） ===
-PERF_KEY_DEF(MASTER_RPC_GET_VSEGMENT_VIEW,     "rpc_service.cpp::GetVSegmentView",     "GetVSegmentView")
-PERF_KEY_DEF(MASTER_RPC_GET_PSEGMENT_ENDPOINT, "rpc_service.cpp::GetPSegmentEndpoint", "GetPSegmentEndpoint")
 PERF_KEY_DEF(VSEGMENT_READ_PLAN,               "client_service.cpp::TransferData",     "VSegPlan")
 PERF_KEY_DEF(VSEGMENT_VIEW_LOAD,               "client_service.cpp::TransferData",     "VSegViewLoad")
 PERF_KEY_DEF(VSEGMENT_ENDPOINT_RESOLVE,        "client_service.cpp::TransferData",     "VSegEndpointResolve")

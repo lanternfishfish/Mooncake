@@ -121,7 +121,7 @@ inline bool operator==(const VSegmentView& left, const VSegmentView& right) {
 
 // 运行时路由：一个 vsegment 的完整物理位置。随入口 RPC 响应一起下发
 // （GetReplicaList / PutStart / CopyStart / MoveStart），客户端据此直接构造
-// 传输计划，不再单独调用 GetVSegmentView / GetPSegmentEndpoint。
+// 传输计划；旧的 view/endpoint 解析 RPC 已删除。
 struct PSegmentRouteEntry {
     std::string segment_id;
     std::string endpoint;

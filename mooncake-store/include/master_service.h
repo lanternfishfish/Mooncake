@@ -210,15 +210,11 @@ class MasterService {
     // 测试专用：阻塞等待 stale-evict 异步 drain 队列清空（含 1s debounce
     // 与在途请求），上限 5s。生产代码勿用；non-etcd 构建为空操作。
     void FlushStaleEvictQueueForTesting();
-    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
-        const std::string& partition_id, const std::string& vsegment_id);
     // 为一组副本构建随入口 RPC 响应下发的 vsegment route（L1）。逻辑主体在
     // vsegment/vsegment_route.cpp；供 WrappedMasterService 在 RPC 边界调用。
     tl::expected<std::vector<vsegment::VSegmentRoute>, ErrorCode>
     BuildVSegmentRoutesForResponse(
         const std::vector<Replica::Descriptor>& replicas);
-    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
-        const std::string& segment_id);
     vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,
         const std::string& operation_id, uint64_t length,
@@ -2852,7 +2848,7 @@ class MasterService {
     BatchGetReplicaListLocal(const std::vector<std::string>& keys,
                              const TenantId& tenant_id);
     // ---- vsegment route 内联（L1）：逻辑主体在 vsegment/vsegment_route.cpp ----
-    // 物理段运行时位置；与 GetPSegmentEndpoint 共用同一份查表语义。
+    // 物理段运行时位置（唯一查表入口；旧 endpoint RPC 已删除）。
     bool ResolvePSegmentLocation(const std::string& segment_id,
                                  vsegment::PSegmentLocation* location);
     // root filesystem directory for persistent storage

@@ -72,16 +72,6 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::GetVSegmentView> {
-    static constexpr const char* value = "GetVSegmentView";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetPSegmentEndpoint> {
-    static constexpr const char* value = "GetPSegmentEndpoint";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::VSegmentPutStart> {
     static constexpr const char* value = "VSegmentPutStart";
 };
@@ -1253,26 +1243,6 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key) {
     return GetReplicaList(object_key, tenant_id_.value());
-}
-
-tl::expected<vsegment::VSegmentView, ErrorCode>
-MasterClient::GetVSegmentView(const std::string& partition_id,
-                              const std::string& vsegment_id) {
-    auto target = ResolveVSegmentSubmaster(partition_id);
-    if (!target) return tl::make_unexpected(target.error());
-    if (!target->empty()) {
-        return invoke_rpc_to<&WrappedMasterService::GetVSegmentView,
-                             vsegment::VSegmentView>(*target, partition_id,
-                                                     vsegment_id);
-    }
-    return invoke_rpc<&WrappedMasterService::GetVSegmentView,
-                      vsegment::VSegmentView>(partition_id, vsegment_id);
-}
-
-tl::expected<vsegment::PSegmentLocation, ErrorCode>
-MasterClient::GetPSegmentEndpoint(const std::string& segment_id) {
-    return invoke_rpc<&WrappedMasterService::GetPSegmentEndpoint,
-                      vsegment::PSegmentLocation>(segment_id);
 }
 
 vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(

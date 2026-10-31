@@ -1,10 +1,6 @@
 #pragma once
 
-#include <algorithm>
-#include <deque>
-#include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "replica.h"
@@ -12,46 +8,12 @@
 
 namespace mooncake::vsegment {
 
-class VSegmentViewProvider {
-   public:
-    virtual ~VSegmentViewProvider() = default;
-    virtual ErrorCode LoadView(const std::string& partition_id,
-                               const std::string& vsegment_id,
-                               VSegmentView* view,
-                               std::string* detail = nullptr) = 0;
-};
-
+// 物理段的运行时位置（master 侧 SegmentRegistry 查表结果）。
 struct PSegmentLocation {
     std::string endpoint;
     uint64_t base_address{0};
 };
 YLT_REFL(PSegmentLocation, endpoint, base_address);
-
-class SegmentEndpointResolver {
-   public:
-    virtual ~SegmentEndpointResolver() = default;
-    virtual ErrorCode ResolveLocation(const std::string& segment_id,
-                                      PSegmentLocation* location) = 0;
-};
-
-class VSegmentViewCache {
-   public:
-    explicit VSegmentViewCache(size_t max_entries = 4096)
-        : max_entries_(std::max<size_t>(1, max_entries)) {}
-    bool Find(const std::string& partition_id, const std::string& vsegment_id,
-              VSegmentView* view) const;
-    ErrorCode Insert(const VSegmentView& view,
-                     std::string* detail = nullptr);
-    void Erase(const std::string& partition_id,
-               const std::string& vsegment_id);
-    size_t Size() const;
-
-   private:
-    const size_t max_entries_;
-    mutable std::mutex mutex_;
-    std::unordered_map<std::string, VSegmentView> views_;
-    std::deque<std::string> insertion_order_;
-};
 
 struct EndpointTransferSubRequest {
     TransferSubRequest transfer;
@@ -65,28 +27,14 @@ struct VSegmentTransferPlan {
     explicit operator bool() const { return error == ErrorCode::OK; }
 };
 
+// 只消费入口 RPC 内联的 route：不发任何控制面 RPC，也没有 view/endpoint 缓存。
 class VSegmentTransferPlanner {
    public:
-    VSegmentTransferPlanner(VSegmentViewProvider* provider,
-                            SegmentEndpointResolver* endpoint_resolver,
-                            VSegmentViewCache* cache)
-        : provider_(provider),
-          endpoint_resolver_(endpoint_resolver),
-          cache_(cache) {}
+    VSegmentTransferPlanner() = default;
 
-    VSegmentTransferPlan Plan(const VSegmentDescriptor& replica,
-                              const std::vector<ClientSlice>& slices);
-
-    // 直接消费入口 RPC 内联的 route：不经过 provider / resolver / view cache，
-    // 也不再发任何控制面 RPC。身份 / checksum / 成员完整性校验全部本地完成。
     VSegmentTransferPlan PlanWithRoute(const VSegmentDescriptor& replica,
                                        const std::vector<ClientSlice>& slices,
                                        const VSegmentRoute& route);
-
-   private:
-    VSegmentViewProvider* provider_;
-    SegmentEndpointResolver* endpoint_resolver_;
-    VSegmentViewCache* cache_;
 };
 
 }  // namespace mooncake::vsegment

@@ -7280,21 +7280,6 @@ auto MasterService::GetReplicaList(const std::string& key,
     return GetReplicaListLocal(object_id);
 }
 
-tl::expected<vsegment::VSegmentView, ErrorCode>
-MasterService::GetVSegmentView(const std::string& partition_id,
-                               const std::string& vsegment_id) {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
-    const auto ready = CheckVSegmentServiceability(partition_id);
-    if (ready != ErrorCode::OK) return tl::make_unexpected(ready);
-    if (!vsegment_service_)
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    vsegment::VSegmentView view;
-    auto result =
-        vsegment_service_->LoadView(partition_id, vsegment_id, &view);
-    if (result != ErrorCode::OK) return tl::make_unexpected(result);
-    return view;
-}
-
 bool MasterService::ResolvePSegmentLocation(
     const std::string& segment_id, vsegment::PSegmentLocation* location) {
     if (location == nullptr) return false;
@@ -7307,17 +7292,6 @@ bool MasterService::ResolvePSegmentLocation(
     location->endpoint = segment.te_endpoint;
     location->base_address = static_cast<uint64_t>(segment.base);
     return true;
-}
-
-tl::expected<vsegment::PSegmentLocation, ErrorCode>
-MasterService::GetPSegmentEndpoint(const std::string& segment_id) {
-    UUID id;
-    if (!StringToUuid(segment_id, id))
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    vsegment::PSegmentLocation location;
-    if (!ResolvePSegmentLocation(segment_id, &location))
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    return location;
 }
 
 tl::expected<std::vector<vsegment::VSegmentRoute>, ErrorCode>
