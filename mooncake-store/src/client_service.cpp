@@ -1425,10 +1425,11 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
+    auto& value = result.value();
     return QueryResult(
-        std::move(result.value().replicas),
-        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().object_checksum);
+        std::move(value.replicas),
+        start_time + std::chrono::milliseconds(value.lease_ttl_ms),
+        value.object_checksum, std::move(value.vsegment_routes));
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1489,11 +1490,11 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
+            auto& value = response[i].value();
             results.emplace_back(QueryResult(
-                std::move(response[i].value().replicas),
-                start_time +
-                    std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum));
+                std::move(value.replicas),
+                start_time + std::chrono::milliseconds(value.lease_ttl_ms),
+                value.object_checksum, std::move(value.vsegment_routes)));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
