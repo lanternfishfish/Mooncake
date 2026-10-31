@@ -1,4 +1,5 @@
 #include "vsegment/vsegment.h"
+#include "rpc_types.h"
 #include "vsegment/vsegment_runtime.h"
 #include "vsegment/vsegment_transfer.h"
 #include "vsegment/vsegment_route.h"
@@ -2549,6 +2550,26 @@ TEST_F(VSegmentPlanWithRouteTest, FindRouteMatchesIdentityAndRejectsMismatch) {
 
     // 没有 route 列表时必须返回 nullptr（调用方按硬失败处理）。
     EXPECT_EQ(FindRoute(nullptr, matching), nullptr);
+}
+
+
+// 诊断用：内联 route 必须能通过 struct_pack 往返（wire 类型回归）。
+TEST(VSegmentWireTest, InlineRouteSurvivesStructPack) {
+    GetReplicaListResponse response;
+    response.lease_ttl_ms = 1234;
+    VSegmentRoute route;
+    route.view.partition_id = "p-1";
+    route.view.vsegment_id = "vs-1";
+    route.locations.push_back(PSegmentRouteEntry{"seg-1", "ep://1", 4096});
+    response.vsegment_routes.push_back(route);
+
+    auto buffer = struct_pack::serialize(response);
+    auto decoded =
+        struct_pack::deserialize<GetReplicaListResponse>(buffer);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->vsegment_routes.size(), 1u);
+    EXPECT_EQ(decoded->vsegment_routes[0].view.partition_id, "p-1");
+    EXPECT_EQ(decoded->vsegment_routes[0].locations.size(), 1u);
 }
 
 }  // namespace
