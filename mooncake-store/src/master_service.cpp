@@ -4285,6 +4285,7 @@ ErrorCode MasterService::CheckSlotServiceability(uint16_t slot) const {
     return ErrorCode::SLOT_NOT_OWNED;
 }
 
+#ifdef STORE_USE_ETCD
 void MasterService::MaybeWarnGhostFallback(const char* where,
                                            uint16_t slot) const {
     // 幽灵写瞬态告警（§16.14.6 验证辅助）：模型曾启用（seen）但本 slot
@@ -4323,6 +4324,7 @@ void MasterService::MaybeWarnGhostFallback(const char* where,
                      << ", cached_group_count=" << group_count;
     }
 }
+#endif
 
 ErrorCode MasterService::CheckSlotWritable(uint16_t slot) const {
     // §16.19.3 写路径校验（读写分离）：ready/expected 判定复用读路径的
@@ -11067,6 +11069,7 @@ auto MasterService::ReportInvalidReplicaEndpoints(
             }
         }
     }
+#ifdef STORE_USE_ETCD
     {
         // etcd 兜底：对本地段表未命中的上报值，拉全量 SegmentDescriptor 按
         // te_endpoint / segment_name 匹配解析 UUID（quota snapshot 死段残留
@@ -11093,6 +11096,7 @@ auto MasterService::ReportInvalidReplicaEndpoints(
             }
         }
     }
+#endif
 
     size_t before = 0;
     size_t after = 0;
