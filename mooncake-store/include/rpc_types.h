@@ -5,6 +5,7 @@
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
+#include "vsegment/vsegment.h"
 
 namespace mooncake {
 
@@ -41,6 +42,9 @@ struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
     std::optional<uint64_t> object_checksum;
+    // vsegment 路由内联：仅当 replicas 里含 vsegment 副本时非空，按
+    // (partition_id, vsegment_id) 去重。非 vsegment 响应保持为空（零 route payload）。
+    std::vector<vsegment::VSegmentRoute> vsegment_routes;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -51,7 +55,8 @@ struct GetReplicaListResponse {
           lease_ttl_ms(lease_ttl_ms_param),
           object_checksum(object_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
+         vsegment_routes);
 
 /**
  * @brief PutStart 响应（vsegment 两阶段写预留接口）。
@@ -61,6 +66,9 @@ YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 struct PutStartResult {
     std::string operation_id;
     std::vector<Replica::Descriptor> replicas;
+    // 同 GetReplicaListResponse::vsegment_routes：本轮 PutStart 分配到的
+    // vsegment 路由；非 vsegment 写路径为空。
+    std::vector<vsegment::VSegmentRoute> vsegment_routes;
 
     PutStartResult() = default;
     PutStartResult(std::string operation_id_param,
@@ -68,7 +76,7 @@ struct PutStartResult {
         : operation_id(std::move(operation_id_param)),
           replicas(std::move(replicas_param)) {}
 };
-YLT_REFL(PutStartResult, operation_id, replicas);
+YLT_REFL(PutStartResult, operation_id, replicas, vsegment_routes);
 
 struct CachedQueryResultResponse {
     bool success;
@@ -83,6 +91,22 @@ struct CachedQueryResultResponse {
         : success(false), value(), error(error_param) {}
 };
 YLT_REFL(CachedQueryResultResponse, success, value, error);
+
+/**
+ * @brief Response structure for BatchGetReplicaList operation.
+ *
+ * 逐 key 结果（复用 CachedQueryResultResponse 承载 success/value/error，与
+ * 现有缓存查询响应同一形态）+ 整批去重的 vsegment 路由。路由按
+ * (partition_id, vsegment_id) 去重，避免同一 vsegment 在批量里重复序列化。
+ *
+ * 注意：这里刻意不用 vector<tl::expected<...>> 作为结构体成员——反射/序列化
+ * 走的是 YLT_REFL 字段，expected 只在顶层返回值上被 coro_rpc 直接支持。
+ */
+struct BatchGetReplicaListResponse {
+    std::vector<CachedQueryResultResponse> results;
+    std::vector<vsegment::VSegmentRoute> vsegment_routes;
+};
+YLT_REFL(BatchGetReplicaListResponse, results, vsegment_routes);
 
 /**
  * @brief Response structure for GetStorageConfig operation
@@ -118,8 +142,10 @@ YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
 struct CopyStartResponse {
     Replica::Descriptor source;
     std::vector<Replica::Descriptor> targets;
+    // vsegment 源/目标所需的路由（v1.2 起随响应内联下发）
+    std::vector<vsegment::VSegmentRoute> vsegment_routes;
 };
-YLT_REFL(CopyStartResponse, source, targets);
+YLT_REFL(CopyStartResponse, source, targets, vsegment_routes);
 
 /**
  * @brief Response structure for PromotionAllocStart (L2->L1 promotion-on-hit).
@@ -136,8 +162,10 @@ YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
 struct MoveStartResponse {
     Replica::Descriptor source;
     std::optional<Replica::Descriptor> target;
+    // vsegment 源/目标所需的路由（v1.2 起随响应内联下发）
+    std::vector<vsegment::VSegmentRoute> vsegment_routes;
 };
-YLT_REFL(MoveStartResponse, source, target);
+YLT_REFL(MoveStartResponse, source, target, vsegment_routes);
 
 /**
  * @brief Response structure for InterMasterHandshake: identity + ownership

@@ -119,6 +119,23 @@ inline bool operator==(const VSegmentView& left, const VSegmentView& right) {
            left.members == right.members && left.checksum == right.checksum;
 }
 
+// 运行时路由：一个 vsegment 的完整物理位置。随入口 RPC 响应一起下发
+// （GetReplicaList / PutStart / CopyStart / MoveStart），客户端据此直接构造
+// 传输计划，不再单独调用 GetVSegmentView / GetPSegmentEndpoint。
+struct PSegmentRouteEntry {
+    std::string segment_id;
+    std::string endpoint;
+    uint64_t base_address{0};
+};
+YLT_REFL(PSegmentRouteEntry, segment_id, endpoint, base_address);
+
+struct VSegmentRoute {
+    VSegmentView view;
+    // 与 view.members 一一对应（同序、同 segment_id）；由 master 建路由时保证。
+    std::vector<PSegmentRouteEntry> locations;
+};
+YLT_REFL(VSegmentRoute, view, locations);
+
 struct VSegmentAllocationResult {
     ErrorCode error{ErrorCode::OK};
     VSegmentView view;
