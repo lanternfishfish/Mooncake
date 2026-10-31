@@ -2532,5 +2532,24 @@ TEST_F(VSegmentPlanWithRouteTest, RejectsMemberOrderMismatch) {
     EXPECT_EQ(plan.error, ErrorCode::SEGMENT_NOT_FOUND);
 }
 
+TEST_F(VSegmentPlanWithRouteTest, FindRouteMatchesIdentityAndRejectsMismatch) {
+    const auto route = MakeRoute("p-1", "vs-1");
+    const std::vector<VSegmentRoute> routes{route};
+
+    const VSegmentDescriptor matching{"p-1", "vs-1", 0, 64};
+    const auto* found = FindRoute(&routes, matching);
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->view.vsegment_id, "vs-1");
+
+    const VSegmentDescriptor other_partition{"p-2", "vs-1", 0, 64};
+    EXPECT_EQ(FindRoute(&routes, other_partition), nullptr);
+
+    const VSegmentDescriptor other_vsegment{"p-1", "vs-2", 0, 64};
+    EXPECT_EQ(FindRoute(&routes, other_vsegment), nullptr);
+
+    // 没有 route 列表时必须返回 nullptr（调用方按硬失败处理）。
+    EXPECT_EQ(FindRoute(nullptr, matching), nullptr);
+}
+
 }  // namespace
 }  // namespace mooncake::vsegment
