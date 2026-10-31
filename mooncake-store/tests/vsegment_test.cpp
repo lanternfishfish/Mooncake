@@ -2600,5 +2600,91 @@ TEST_F(VSegmentRouteBuilderTest, LoadViewErrorPropagates) {
     EXPECT_EQ(routes.error(), ErrorCode::STALE_ROUTE);
 }
 
+// ---------------------------------------------------------------------------
+// L1：客户端直接消费内联 route（不发任何控制面 RPC）
+// ---------------------------------------------------------------------------
+
+class VSegmentPlanWithRouteTest : public ::testing::Test {
+   protected:
+    static VSegmentRoute MakeRoute(const std::string& partition_id,
+                                   const std::string& vsegment_id) {
+        VSegmentRoute route;
+        route.view.partition_id = partition_id;
+        route.view.vsegment_id = vsegment_id;
+        route.view.stripe_size = 512 * 1024;
+        uint64_t offset = 0;
+        for (const std::string& segment : {"seg-a", "seg-b"}) {
+            route.view.members.push_back(PSegmentExtent{segment, offset, 1 << 20});
+            offset += (1 << 20);
+        }
+        route.view.logical_capacity = offset;
+        route.view.checksum = ComputeViewChecksum(route.view);
+        for (const auto& member : route.view.members) {
+            route.locations.push_back(PSegmentRouteEntry{
+                member.segment_id, "ep-" + member.segment_id, 4096});
+        }
+        return route;
+    }
+};
+
+TEST_F(VSegmentPlanWithRouteTest, BuildsPlanFromInlineRouteWithoutRpc) {
+    VSegmentTransferPlanner planner(nullptr, nullptr, nullptr);
+    const auto route = MakeRoute("p-1", "vs-1");
+    const VSegmentDescriptor replica{"p-1", "vs-1", 0, 512 * 1024};
+
+    std::vector<char> buffer(512 * 1024);
+    std::vector<ClientSlice> slices = {
+        {reinterpret_cast<uint64_t>(buffer.data()), buffer.size()}};
+
+    auto plan = planner.PlanWithRoute(replica, slices, route);
+    ASSERT_TRUE(plan) << plan.detail;
+    ASSERT_FALSE(plan.requests.empty());
+    for (const auto& request : plan.requests) {
+        EXPECT_FALSE(request.endpoint.empty());
+        EXPECT_GE(request.transfer.physical_offset, 4096u);
+    }
+}
+
+TEST_F(VSegmentPlanWithRouteTest, RejectsIdentityMismatch) {
+    VSegmentTransferPlanner planner(nullptr, nullptr, nullptr);
+    const auto route = MakeRoute("p-2", "vs-1");
+    const VSegmentDescriptor replica{"p-1", "vs-1", 0, 512 * 1024};
+    std::vector<char> buffer(512 * 1024);
+    std::vector<ClientSlice> slices = {
+        {reinterpret_cast<uint64_t>(buffer.data()), buffer.size()}};
+
+    auto plan = planner.PlanWithRoute(replica, slices, route);
+    ASSERT_FALSE(plan);
+    EXPECT_EQ(plan.error, ErrorCode::INVALID_VERSION);
+}
+
+TEST_F(VSegmentPlanWithRouteTest, RejectsChecksumMismatch) {
+    VSegmentTransferPlanner planner(nullptr, nullptr, nullptr);
+    auto route = MakeRoute("p-1", "vs-1");
+    route.view.checksum ^= 0x1U;
+    const VSegmentDescriptor replica{"p-1", "vs-1", 0, 512 * 1024};
+    std::vector<char> buffer(512 * 1024);
+    std::vector<ClientSlice> slices = {
+        {reinterpret_cast<uint64_t>(buffer.data()), buffer.size()}};
+
+    auto plan = planner.PlanWithRoute(replica, slices, route);
+    ASSERT_FALSE(plan);
+    EXPECT_EQ(plan.error, ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST_F(VSegmentPlanWithRouteTest, RejectsMemberOrderMismatch) {
+    VSegmentTransferPlanner planner(nullptr, nullptr, nullptr);
+    auto route = MakeRoute("p-1", "vs-1");
+    std::swap(route.locations[0], route.locations[1]);
+    const VSegmentDescriptor replica{"p-1", "vs-1", 0, 512 * 1024};
+    std::vector<char> buffer(512 * 1024);
+    std::vector<ClientSlice> slices = {
+        {reinterpret_cast<uint64_t>(buffer.data()), buffer.size()}};
+
+    auto plan = planner.PlanWithRoute(replica, slices, route);
+    ASSERT_FALSE(plan);
+    EXPECT_EQ(plan.error, ErrorCode::SEGMENT_NOT_FOUND);
+}
+
 }  // namespace
 }  // namespace mooncake::vsegment

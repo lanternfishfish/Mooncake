@@ -77,6 +77,12 @@ class VSegmentTransferPlanner {
     VSegmentTransferPlan Plan(const VSegmentDescriptor& replica,
                               const std::vector<ClientSlice>& slices);
 
+    // 直接消费入口 RPC 内联的 route：不经过 provider / resolver / view cache，
+    // 也不再发任何控制面 RPC。身份 / checksum / 成员完整性校验全部本地完成。
+    VSegmentTransferPlan PlanWithRoute(const VSegmentDescriptor& replica,
+                                       const std::vector<ClientSlice>& slices,
+                                       const VSegmentRoute& route);
+
    private:
     VSegmentViewProvider* provider_;
     SegmentEndpointResolver* endpoint_resolver_;
