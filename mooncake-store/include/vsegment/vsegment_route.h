@@ -36,4 +36,13 @@ tl::expected<std::vector<VSegmentRoute>, ErrorCode> BuildVSegmentRoutes(
     const std::vector<Replica::Descriptor>& replicas,
     const LoadViewFn& load_view, const ResolveEndpointFn& resolve_endpoint);
 
+// 在响应携带的 route 列表里按 (partition_id, vsegment_id) 精确查找。
+// 找不到返回 nullptr —— 调用方必须把它当作硬失败（不回退旧解析 RPC）。
+const VSegmentRoute* FindRoute(
+    const std::vector<VSegmentRoute>* routes,
+    const VSegmentDescriptor& descriptor);
+
+// 观测：入口响应内联 route 的规模（route 条数 / 成员数），采样控制。
+void LogRouteStats(const char* entry, const std::vector<VSegmentRoute>& routes);
+
 }  // namespace mooncake::vsegment

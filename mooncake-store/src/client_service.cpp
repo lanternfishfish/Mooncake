@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include "allocator.h"
+#include "vsegment/vsegment_route.h"
 #include "segment.h"
 
 #include <csignal>
@@ -197,20 +198,6 @@ struct ReplicaTransferSummary {
         }
     }
 };
-
-// 入口 RPC 内联 route 的查找：按 (partition_id, vsegment_id) 精确匹配。
-const vsegment::VSegmentRoute* FindInlineRoute(
-    const std::vector<vsegment::VSegmentRoute>* routes,
-    const VSegmentDescriptor& descriptor) {
-    if (routes == nullptr) return nullptr;
-    for (const auto& candidate : *routes) {
-        if (candidate.view.partition_id == descriptor.partition_id &&
-            candidate.view.vsegment_id == descriptor.vsegment_id) {
-            return &candidate;
-        }
-    }
-    return nullptr;
-}
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
@@ -2011,7 +1998,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
             const auto descriptor = replica.get_vsegment_descriptor();
             const auto* inline_route =
-                FindInlineRoute(&query_result.vsegment_routes, descriptor);
+                vsegment::FindRoute(&query_result.vsegment_routes, descriptor);
             if (inline_route == nullptr) {
                 LOG(ERROR) << "vsegment route missing from entry RPC response "
                            << "(batch get): partition=" << descriptor.partition_id
@@ -2955,7 +2942,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     const auto descriptor =
                         replica.get_vsegment_descriptor();
                     const auto* inline_route =
-                        FindInlineRoute(&op.vsegment_routes, descriptor);
+                        vsegment::FindRoute(&op.vsegment_routes, descriptor);
                     if (inline_route == nullptr) {
                         op.transfer_summary.RecordFailure(
                             replica_type, ErrorCode::INVALID_VERSION);
@@ -5052,18 +5039,8 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         const auto vsegment_descriptor =
             replica_descriptor.get_vsegment_descriptor();
         // L1：route 必须来自入口 RPC 响应（(partition, vsegment) 精确匹配）。
-        const vsegment::VSegmentRoute* inline_route = nullptr;
-        if (vsegment_routes != nullptr) {
-            for (const auto& candidate : *vsegment_routes) {
-                if (candidate.view.partition_id ==
-                        vsegment_descriptor.partition_id &&
-                    candidate.view.vsegment_id ==
-                        vsegment_descriptor.vsegment_id) {
-                    inline_route = &candidate;
-                    break;
-                }
-            }
-        }
+        const vsegment::VSegmentRoute* inline_route =
+            vsegment::FindRoute(vsegment_routes, vsegment_descriptor);
         if (inline_route == nullptr) {
             LOG(ERROR) << "vsegment route missing from entry RPC response: "
                        << "partition=" << vsegment_descriptor.partition_id
@@ -5170,16 +5147,8 @@ ErrorCode Client::TransferReadInternal(
         replica.logical_offset += src_offset;
         replica.length = length;
         // L1：range read 同样只能消费入口 RPC 内联的 route。
-        const vsegment::VSegmentRoute* inline_route = nullptr;
-        if (vsegment_routes != nullptr) {
-            for (const auto& candidate : *vsegment_routes) {
-                if (candidate.view.partition_id == replica.partition_id &&
-                    candidate.view.vsegment_id == replica.vsegment_id) {
-                    inline_route = &candidate;
-                    break;
-                }
-            }
-        }
+        const vsegment::VSegmentRoute* inline_route =
+            vsegment::FindRoute(vsegment_routes, replica);
         if (inline_route == nullptr) {
             LOG(ERROR) << "vsegment route missing from entry RPC response "
                        << "(range read): partition=" << replica.partition_id

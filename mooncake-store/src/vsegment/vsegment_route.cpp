@@ -67,4 +67,26 @@ tl::expected<std::vector<VSegmentRoute>, ErrorCode> BuildVSegmentRoutes(
     return routes;
 }
 
+const VSegmentRoute* FindRoute(
+    const std::vector<VSegmentRoute>* routes,
+    const VSegmentDescriptor& descriptor) {
+    if (routes == nullptr) return nullptr;
+    for (const auto& candidate : *routes) {
+        if (candidate.view.partition_id == descriptor.partition_id &&
+            candidate.view.vsegment_id == descriptor.vsegment_id) {
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+void LogRouteStats(const char* entry,
+                   const std::vector<VSegmentRoute>& routes) {
+    if (!mooncake::logging::ShouldSampleHiFreqLog()) return;
+    size_t members = 0;
+    for (const auto& route : routes) members += route.locations.size();
+    MC_LOG(INFO) << "vsegment_route_inline entry=" << entry
+                 << " routes=" << routes.size() << " members=" << members;
+}
+
 }  // namespace mooncake::vsegment

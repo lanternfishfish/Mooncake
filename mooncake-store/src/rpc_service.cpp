@@ -18,6 +18,7 @@
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
 #include "vsegment/vsegment_metrics.h"
+#include "vsegment/vsegment_route.h"
 
 namespace mooncake {
 namespace {
@@ -38,16 +39,6 @@ std::string ResolveClientHost(MasterService& svc, const UUID& client_id) {
         return out;
     }
     return "unknown";
-}
-
-// L1 观测：入口响应内联 route 的规模与失败原因（采样控制，避免刷屏）。
-void LogInlineRouteStats(const char* entry,
-                         const std::vector<vsegment::VSegmentRoute>& routes) {
-    if (!mooncake::logging::ShouldSampleHiFreqLog()) return;
-    size_t members = 0;
-    for (const auto& route : routes) members += route.locations.size();
-    MC_LOG(INFO) << "vsegment_route_inline entry=" << entry
-                 << " routes=" << routes.size() << " members=" << members;
 }
 
 tl::expected<TenantId, ErrorCode> ResolveRequestTenantId(std::string_view raw) {
@@ -331,7 +322,7 @@ WrappedMasterService::GetReplicaList(const std::string& key,
             result->replicas);
         if (!routes) return tl::make_unexpected(routes.error());
         result->vsegment_routes = std::move(*routes);
-        LogInlineRouteStats("GetReplicaList", result->vsegment_routes);
+        vsegment::LogRouteStats("GetReplicaList", result->vsegment_routes);
     }
     if (sample) {
         const auto latency_us =
@@ -458,7 +449,7 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             all_routes.insert(all_routes.end(), item->vsegment_routes.begin(),
                               item->vsegment_routes.end());
         }
-        LogInlineRouteStats("BatchGetReplicaList", all_routes);
+        vsegment::LogRouteStats("BatchGetReplicaList", all_routes);
     }
 
     size_t failure_count = 0;
@@ -581,7 +572,7 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                             return tl::make_unexpected(routes.error());
                         }
                         started.vsegment_routes = std::move(*routes);
-                        LogInlineRouteStats("PutStart",
+                        vsegment::LogRouteStats("PutStart",
                                             started.vsegment_routes);
                         return started;
                     }
@@ -1415,7 +1406,7 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
             return tl::make_unexpected(routes.error());
         }
         result->vsegment_routes = std::move(*routes);
-        LogInlineRouteStats("CopyStart", result->vsegment_routes);
+        vsegment::LogRouteStats("CopyStart", result->vsegment_routes);
     }
     return result;
 }
@@ -1507,7 +1498,7 @@ tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
             return tl::make_unexpected(routes.error());
         }
         result->vsegment_routes = std::move(*routes);
-        LogInlineRouteStats("MoveStart", result->vsegment_routes);
+        vsegment::LogRouteStats("MoveStart", result->vsegment_routes);
     }
     return result;
 }
