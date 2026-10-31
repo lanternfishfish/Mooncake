@@ -198,6 +198,20 @@ struct ReplicaTransferSummary {
     }
 };
 
+// 入口 RPC 内联 route 的查找：按 (partition_id, vsegment_id) 精确匹配。
+const vsegment::VSegmentRoute* FindInlineRoute(
+    const std::vector<vsegment::VSegmentRoute>* routes,
+    const VSegmentDescriptor& descriptor) {
+    if (routes == nullptr) return nullptr;
+    for (const auto& candidate : *routes) {
+        if (candidate.view.partition_id == descriptor.partition_id &&
+            candidate.view.vsegment_id == descriptor.vsegment_id) {
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
     if (config.nof_replica_num == 0) {
@@ -1995,8 +2009,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 client_slices.push_back(
                     {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
             }
-            auto plan = vsegment_transfer_planner_->Plan(
-                replica.get_vsegment_descriptor(), client_slices);
+            const auto descriptor = replica.get_vsegment_descriptor();
+            const auto* inline_route =
+                FindInlineRoute(&query_result.vsegment_routes, descriptor);
+            if (inline_route == nullptr) {
+                LOG(ERROR) << "vsegment route missing from entry RPC response "
+                           << "(batch get): partition=" << descriptor.partition_id
+                           << ", vsegment=" << descriptor.vsegment_id;
+                results[i] = tl::unexpected(ErrorCode::INVALID_VERSION);
+                continue;
+            }
+            auto plan = vsegment_transfer_planner_->PlanWithRoute(
+                descriptor, client_slices, *inline_route);
             if (!plan) {
                 results[i] = tl::unexpected(plan.error);
                 continue;
@@ -2554,6 +2578,9 @@ class PutOperation {
     PutOperationState state = PutOperationState::PENDING;
     tl::expected<void, ErrorCode> result;
     std::vector<Replica::Descriptor> replicas;
+    // 入口 RPC 响应内联的 vsegment route（batch put 目前不产生 vsegment
+    // descriptor，因此通常为空；单 key 路径直接在 Put 里透传）。
+    std::vector<vsegment::VSegmentRoute> vsegment_routes;
     std::vector<PendingTransferRecord> pending_transfers;
 
     size_t requested_memory_replicas = 0;
@@ -2925,8 +2952,19 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                             {reinterpret_cast<uint64_t>(slice.ptr),
                              slice.size});
                     }
-                    auto plan = vsegment_transfer_planner_->Plan(
-                        replica.get_vsegment_descriptor(), client_slices);
+                    const auto descriptor =
+                        replica.get_vsegment_descriptor();
+                    const auto* inline_route =
+                        FindInlineRoute(&op.vsegment_routes, descriptor);
+                    if (inline_route == nullptr) {
+                        op.transfer_summary.RecordFailure(
+                            replica_type, ErrorCode::INVALID_VERSION);
+                        op.AppendFailureContext(
+                            "vsegment route missing from entry RPC response");
+                        continue;
+                    }
+                    auto plan = vsegment_transfer_planner_->PlanWithRoute(
+                        descriptor, client_slices, *inline_route);
                     if (!plan) {
                         op.transfer_summary.RecordFailure(replica_type,
                                                           plan.error);
