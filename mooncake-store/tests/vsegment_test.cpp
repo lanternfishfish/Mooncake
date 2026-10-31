@@ -2474,7 +2474,7 @@ class VSegmentPlanWithRouteTest : public ::testing::Test {
 };
 
 TEST_F(VSegmentPlanWithRouteTest, BuildsPlanFromInlineRouteWithoutRpc) {
-    VSegmentTransferPlanner planner(nullptr, nullptr, nullptr);
+    VSegmentTransferPlanner planner;
     const auto route = MakeRoute("p-1", "vs-1");
     const VSegmentDescriptor replica{"p-1", "vs-1", 0, 512 * 1024};
 
@@ -2492,7 +2492,7 @@ TEST_F(VSegmentPlanWithRouteTest, BuildsPlanFromInlineRouteWithoutRpc) {
 }
 
 TEST_F(VSegmentPlanWithRouteTest, RejectsIdentityMismatch) {
-    VSegmentTransferPlanner planner(nullptr, nullptr, nullptr);
+    VSegmentTransferPlanner planner;
     const auto route = MakeRoute("p-2", "vs-1");
     const VSegmentDescriptor replica{"p-1", "vs-1", 0, 512 * 1024};
     std::vector<char> buffer(512 * 1024);
@@ -2505,7 +2505,7 @@ TEST_F(VSegmentPlanWithRouteTest, RejectsIdentityMismatch) {
 }
 
 TEST_F(VSegmentPlanWithRouteTest, RejectsChecksumMismatch) {
-    VSegmentTransferPlanner planner(nullptr, nullptr, nullptr);
+    VSegmentTransferPlanner planner;
     auto route = MakeRoute("p-1", "vs-1");
     route.view.checksum ^= 0x1U;
     const VSegmentDescriptor replica{"p-1", "vs-1", 0, 512 * 1024};
@@ -2519,7 +2519,7 @@ TEST_F(VSegmentPlanWithRouteTest, RejectsChecksumMismatch) {
 }
 
 TEST_F(VSegmentPlanWithRouteTest, RejectsMemberOrderMismatch) {
-    VSegmentTransferPlanner planner(nullptr, nullptr, nullptr);
+    VSegmentTransferPlanner planner;
     auto route = MakeRoute("p-1", "vs-1");
     std::swap(route.locations[0], route.locations[1]);
     const VSegmentDescriptor replica{"p-1", "vs-1", 0, 512 * 1024};
