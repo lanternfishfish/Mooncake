@@ -307,6 +307,22 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
     return true;
 }
 
+bool ScopedSegmentAccess::GetSegmentEndpoint(const UUID& segment_id,
+                                             std::string* te_endpoint,
+                                             uint64_t* base_address) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return false;
+    }
+    if (te_endpoint != nullptr) {
+        *te_endpoint = mounted->second.segment.te_endpoint;
+    }
+    if (base_address != nullptr) {
+        *base_address = static_cast<uint64_t>(mounted->second.segment.base);
+    }
+    return true;
+}
+
 bool ScopedSegmentAccess::ReplaceAllocators(
     const std::vector<AllocatorReplacement>& replacements) {
     std::vector<AllocatorManager::Replacement> manager_replacements;

@@ -7286,12 +7286,10 @@ bool MasterService::ResolvePSegmentLocation(
     UUID id;
     if (!StringToUuid(segment_id, id)) return false;
     ScopedSegmentAccess access = segment_manager_.getSegmentAccess();
-    Segment segment;
-    if (!access.GetSegment(id, segment)) return false;
-    if (segment.te_endpoint.empty()) return false;
-    location->endpoint = segment.te_endpoint;
-    location->base_address = static_cast<uint64_t>(segment.base);
-    return true;
+    // 热路径：只取 endpoint/base，避免整段 Segment（含字符串）拷贝。
+    return access.GetSegmentEndpoint(id, &location->endpoint,
+                                     &location->base_address) &&
+           !location->endpoint.empty();
 }
 
 tl::expected<std::vector<vsegment::VSegmentRoute>, ErrorCode>

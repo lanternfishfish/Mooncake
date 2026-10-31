@@ -166,6 +166,13 @@ class ScopedSegmentAccess {
 
     bool GetSegment(const UUID& segment_id, Segment& segment) const;
 
+    /**
+     * @brief 只读取 segment 的传输端点与基址（热路径用，避免整段 Segment
+     * 拷贝）。vsegment route 构建按成员逐个查表，走这里。
+     */
+    bool GetSegmentEndpoint(const UUID& segment_id, std::string* te_endpoint,
+                            uint64_t* base_address) const;
+
     struct AllocatorReplacement {
         UUID segment_id;
         std::shared_ptr<BufferAllocatorBase> expected;
