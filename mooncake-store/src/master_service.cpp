@@ -30,6 +30,7 @@
 #include "mooncake_logging.h"
 #include "common.h"
 #include "segment.h"
+#include "vsegment/vsegment_route.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
 #endif
@@ -1051,6 +1052,15 @@ MasterService::TryVSegmentPutStart(
     std::vector<Replica::Descriptor> descriptors;
     for (const auto& replica : replicas)
         descriptors.push_back(replica.get_descriptor());
+    // 路由内联：在写入 metadata / processing 状态**之前**把 route 建好。
+    // 失败时只需撤销逻辑预留 + 配额（此时尚无对象元数据残留），不存在
+    // 「已扣配额、已插元数据」的中间态。
+    auto routes = BuildVSegmentRoutesForResponse(descriptors);
+    if (!routes) {
+        abort();
+        AbortTenantQuota(*normalized, quota_charge);
+        return tl::make_unexpected(routes.error());
+    }
     const std::string group_id =
         config.group_ids && !config.group_ids->empty()
             ? config.group_ids->front()
@@ -1070,10 +1080,12 @@ MasterService::TryVSegmentPutStart(
     it->second.reserved_quota_charge_bytes = quota_charge;
     RegisterGroupMember(tenant_state, *normalized, key, group_id);
     tenant_state.processing_keys.insert(key);
-    return std::optional<PutStartResult>(
-        PutStartResult{operation_ids.size() == 1 ? operation_ids.front()
-                                                : std::string{},
-                       std::move(descriptors)});
+    PutStartResult start_result{operation_ids.size() == 1
+                                    ? operation_ids.front()
+                                    : std::string{},
+                                std::move(descriptors)};
+    start_result.vsegment_routes = std::move(*routes);
+    return std::optional<PutStartResult>(std::move(start_result));
 }
 
 void MasterService::KickSlotHeartbeat() {
@@ -7294,19 +7306,61 @@ MasterService::GetVSegmentView(const std::string& partition_id,
     return view;
 }
 
+bool MasterService::ResolvePSegmentLocation(
+    const std::string& segment_id, vsegment::PSegmentLocation* location) {
+    if (location == nullptr) return false;
+    UUID id;
+    if (!StringToUuid(segment_id, id)) return false;
+    ScopedSegmentAccess access = segment_manager_.getSegmentAccess();
+    Segment segment;
+    if (!access.GetSegment(id, segment)) return false;
+    if (segment.te_endpoint.empty()) return false;
+    location->endpoint = segment.te_endpoint;
+    location->base_address = static_cast<uint64_t>(segment.base);
+    return true;
+}
+
 tl::expected<vsegment::PSegmentLocation, ErrorCode>
 MasterService::GetPSegmentEndpoint(const std::string& segment_id) {
     UUID id;
     if (!StringToUuid(segment_id, id))
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    ScopedSegmentAccess access = segment_manager_.getSegmentAccess();
-    Segment segment;
-    if (!access.GetSegment(id, segment))
+    vsegment::PSegmentLocation location;
+    if (!ResolvePSegmentLocation(segment_id, &location))
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    if (segment.te_endpoint.empty())
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    return vsegment::PSegmentLocation{
-        segment.te_endpoint, static_cast<uint64_t>(segment.base)};
+    return location;
+}
+
+tl::expected<std::vector<vsegment::VSegmentRoute>, ErrorCode>
+MasterService::BuildVSegmentRoutesForResponse(
+    const std::vector<Replica::Descriptor>& replicas) {
+    // 热路径守卫：没有 vsegment 副本时直接返回空 route（不构造回调、不加锁）。
+    bool has_vsegment = false;
+    for (const auto& replica : replicas) {
+        if (replica.is_vsegment_replica()) {
+            has_vsegment = true;
+            break;
+        }
+    }
+    if (!has_vsegment) return std::vector<vsegment::VSegmentRoute>{};
+    // 上游友好：本函数只做两个薄适配；去重 / 成员完整性 / 错误码都在
+    // vsegment/vsegment_route.cpp（fork 独有文件）。
+    auto load_view = [this](const std::string& partition_id,
+                            const std::string& vsegment_id,
+                            vsegment::VSegmentView* view) -> ErrorCode {
+        if (!vsegment_service_) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        return vsegment_service_->LoadView(partition_id, vsegment_id, view);
+    };
+    auto resolve_endpoint = [this](const std::string& segment_id,
+                                   std::string* endpoint,
+                                   uint64_t* base_address) -> bool {
+        vsegment::PSegmentLocation location;
+        if (!ResolvePSegmentLocation(segment_id, &location)) return false;
+        *endpoint = std::move(location.endpoint);
+        *base_address = location.base_address;
+        return true;
+    };
+    return vsegment::BuildVSegmentRoutes(replicas, load_view, resolve_endpoint);
 }
 
 vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
@@ -7515,6 +7569,11 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     // }
     (void)record_io_access;
     (void)io_access;
+    // 路由内联：读响应直接携带 vsegment route；建 route 失败即整单失败
+    //（绝不返回「有 descriptor 但没有 route」的响应）。
+    auto routes = BuildVSegmentRoutesForResponse(resp.replicas);
+    if (!routes) return tl::make_unexpected(routes.error());
+    resp.vsegment_routes = std::move(*routes);
     pt_total.End(0);
     return resp;
 }
