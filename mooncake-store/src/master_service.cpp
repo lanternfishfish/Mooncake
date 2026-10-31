@@ -1937,43 +1937,6 @@ uint32_t MasterService::GetOwnedSlotCount() const {
         std::count(ready_owned_.begin(), ready_owned_.end(), true));
 }
 
-std::string MasterService::GetVSegmentStatusLogLine() const {
-    std::ostringstream os;
-    os << "VSegment Status: enabled=" << (vsegment_service_ ? 1 : 0);
-    if (vsegment_service_) {
-        const auto& snapshot = vsegment_service_->quota_snapshot();
-        const auto& metrics = vsegment::VSegmentMetrics::Instance();
-        os << ", generation=" << snapshot.config_generation
-           << ", profiles=" << snapshot.profile_specs.size()
-           << ", partitions_installed="
-           // PartitionCount/VSegmentCount 内部持 manager 锁，快照引用与
-           // metrics 读取均为锁外安全视图。
-           << vsegment_service_->PartitionCount()
-           << ", vsegments=" << vsegment_service_->VSegmentCount()
-           << ", logical_capacity=" << metrics.logical_capacity_bytes()
-           << ", logical_free=" << metrics.logical_free_bytes()
-           << " | pools=";
-        bool first_pool = true;
-        for (const auto& profile : snapshot.profile_specs) {
-            if (!first_pool) os << "; ";
-            first_pool = false;
-            // 成员数取 partition "0" 在该 profile 下的配额 extent 数
-            //（所有 partition 的成员集合相同）。
-            size_t member_count = 0;
-            for (const auto& quota : snapshot.quotas) {
-                if (quota.partition_id == "0" &&
-                    quota.profile_name == profile.name) {
-                    member_count = quota.extents.size();
-                    break;
-                }
-            }
-            os << profile.name << ":members=" << member_count
-               << ",medium=" << profile.required_medium;
-        }
-    }
-    return os.str();
-}
-
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterService::InterMasterAllocateReplicas(
     const std::string& tenant_id, const std::string& key, uint64_t slice_length,
