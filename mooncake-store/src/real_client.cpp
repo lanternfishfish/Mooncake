@@ -399,9 +399,13 @@ using mooncake::SelectBestReplica;
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
+    // vsegment 路由必须随过滤后的 QueryResult 一起传下去：读路径
+    // （client_->Get(key, filtered_qr, slices)）只从 QueryResult 取 route，
+    // 这里丢掉会导致所有 vsegment 读 INVALID_VERSION。
     return QueryResult(
         {replica}, qr.lease_timeout,
-        include_object_checksum ? qr.object_checksum : std::nullopt);
+        include_object_checksum ? qr.object_checksum : std::nullopt,
+        qr.vsegment_routes);
 }
 }  // namespace
 
