@@ -1,7 +1,6 @@
 #include "vsegment/vsegment_transfer.h"
 
 #include <limits>
-#include <unordered_map>
 
 namespace mooncake::vsegment {
 
@@ -51,29 +50,35 @@ VSegmentTransferPlan VSegmentTransferPlanner::PlanWithRoute(
                                     replica.length, slices);
     if (!resolved) return {resolved.error, {}, std::move(resolved.detail)};
 
-    std::unordered_map<std::string, const PSegmentRouteEntry*> locations;
-    locations.reserve(route.locations.size());
-    for (const auto& location : route.locations)
-        locations.emplace(location.segment_id, &location);
+    // 成员数通常 <= 8（route 大小有上限），用线性查表：省掉每读一次的
+    // unordered_map 构造 + string 哈希 + 节点分配。
+    const auto find_location = [&route](
+                                   const std::string& segment_id)
+        -> const PSegmentRouteEntry* {
+        for (const auto& location : route.locations) {
+            if (location.segment_id == segment_id) return &location;
+        }
+        return nullptr;
+    };
 
+    plan.requests.reserve(resolved.requests.size());
     for (auto& request : resolved.requests) {
-        auto it = locations.find(request.segment_id);
-        if (it == locations.end()) {
+        const PSegmentRouteEntry* location = find_location(request.segment_id);
+        if (location == nullptr) {
             plan.error = ErrorCode::SEGMENT_NOT_FOUND;
             plan.detail = "inline route misses segment " + request.segment_id;
             plan.requests.clear();
             return plan;
         }
-        const PSegmentRouteEntry& location = *it->second;
         if (request.physical_offset >
-            std::numeric_limits<uint64_t>::max() - location.base_address) {
+            std::numeric_limits<uint64_t>::max() - location->base_address) {
             plan.error = ErrorCode::INVALID_PARAMS;
             plan.detail = "psegment target address overflows";
             plan.requests.clear();
             return plan;
         }
-        request.physical_offset += location.base_address;
-        plan.requests.push_back({std::move(request), location.endpoint});
+        request.physical_offset += location->base_address;
+        plan.requests.push_back({std::move(request), location->endpoint});
     }
     return plan;
 }
