@@ -2,6 +2,8 @@
 
 #include "vsegment/vsegment_metrics.h"
 
+#include "master_perf.h"  // SpDiag 点位（master 进程）
+
 namespace mooncake::vsegment {
 namespace {
 
@@ -404,12 +406,21 @@ ErrorCode VSegmentService::ReleaseObject(const VSegmentDescriptor& replica,
 ErrorCode VSegmentService::LoadView(const std::string& partition_id,
                                     const std::string& vsegment_id,
                                     VSegmentView* view, std::string* detail) {
+    SpDiag::PerfPoint pt_find(PerfKey::VSEG_LOADVIEW_FIND,
+                              SpDiag::PerfLevel::MODULE);
+    pt_find.Start();
     auto manager = FindPartition(partition_id);
+    pt_find.End(manager ? 0 : -1);
     if (!manager) {
         if (detail) *detail = "Partition is not owned by this SubMaster";
         return ErrorCode::STALE_ROUTE;
     }
-    if (!manager->FindView(vsegment_id, view)) {
+    SpDiag::PerfPoint pt_copy(PerfKey::VSEG_LOADVIEW_COPY,
+                              SpDiag::PerfLevel::MODULE);
+    pt_copy.Start();
+    const bool found = manager->FindView(vsegment_id, view);
+    pt_copy.End(found ? 0 : -1);
+    if (!found) {
         if (detail) *detail = "vsegment view is not active";
         return ErrorCode::SEGMENT_NOT_FOUND;
     }

@@ -298,6 +298,16 @@ PERF_KEY_DEF(MASTER_ROUTE_LOADVIEW,            "master_service.cpp::BuildRoute",
 PERF_KEY_DEF(MASTER_ROUTE_MEMBERS,             "master_service.cpp::BuildRoute",       "RouteMembers")
 PERF_KEY_DEF(VSEGMENT_PLAN_CHECK,              "client_service.cpp::TransferData",     "VSegPlanCheck")
 PERF_KEY_DEF(VSEGMENT_PLAN_EXPAND,             "client_service.cpp::TransferData",     "VSegPlanExpand")
+// 读路径：把一次 RPC 往返拆成 4 段（按 RPC 聚合，读窗口内以 GetReplicaList 为主）
+PERF_KEY_DEF(CLIENT_RPC_POOL_LOOKUP,           "master_client.cpp::invoke_rpc",        "RpcPoolLookup")
+PERF_KEY_DEF(CLIENT_RPC_CALL,                  "master_client.cpp::invoke_rpc",        "RpcCall")
+PERF_KEY_DEF(CLIENT_RPC_RESULT_GET,            "master_client.cpp::invoke_rpc",        "RpcResultGet")
+PERF_KEY_DEF(CLIENT_RPC_RESULT_PARSE,          "master_client.cpp::invoke_rpc",        "RpcResultParse")
+// 读路径：master LoadView 内部两段 + 客户端 QueryResult 构造 + route 查表
+PERF_KEY_DEF(VSEG_LOADVIEW_FIND,               "vsegment_service.cpp::LoadView",       "ViewFindPartition")
+PERF_KEY_DEF(VSEG_LOADVIEW_COPY,               "vsegment_service.cpp::LoadView",       "ViewFindCopy")
+PERF_KEY_DEF(CLIENT_QUERY_RESULT_BUILD,        "client_service.cpp::Query",            "QueryResultBuild")
+PERF_KEY_DEF(CLIENT_FIND_ROUTE,                "client_service.cpp::TransferData",     "FindRoute")
 // === Query 路径下钻（GET 路径核心通信段统计） ===
 PERF_KEY_DEF(QUERY_ROUTE_SWITCH,  "master_client.cpp::Query",  "QueryRouteSwitch")
 PERF_KEY_DEF(QUERY_RPC_CALL,      "master_client.cpp::Query",  "QueryRpcCall")

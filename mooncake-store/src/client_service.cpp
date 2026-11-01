@@ -1426,10 +1426,15 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
         return tl::unexpected(result.error());
     }
     auto& value = result.value();
-    return QueryResult(
-        std::move(value.replicas),
-        start_time + std::chrono::milliseconds(value.lease_ttl_ms),
-        value.object_checksum, std::move(value.vsegment_routes));
+    SpDiag::PerfPoint pt_build(PerfKey::CLIENT_QUERY_RESULT_BUILD,
+                               SpDiag::PerfLevel::MODULE);
+    pt_build.Start();
+    auto query_result =
+        QueryResult(std::move(value.replicas),
+                    start_time + std::chrono::milliseconds(value.lease_ttl_ms),
+                    value.object_checksum, std::move(value.vsegment_routes));
+    pt_build.End(0);
+    return query_result;
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -5040,8 +5045,12 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         const auto vsegment_descriptor =
             replica_descriptor.get_vsegment_descriptor();
         // L1：route 必须来自入口 RPC 响应（(partition, vsegment) 精确匹配）。
+        SpDiag::PerfPoint pt_find_route(PerfKey::CLIENT_FIND_ROUTE,
+                                        SpDiag::PerfLevel::MODULE);
+        pt_find_route.Start();
         const vsegment::VSegmentRoute* inline_route =
             vsegment::FindRoute(vsegment_routes, vsegment_descriptor);
+        pt_find_route.End(inline_route != nullptr ? 0 : -1);
         if (inline_route == nullptr) {
             LOG(ERROR) << "vsegment route missing from entry RPC response: "
                        << "partition=" << vsegment_descriptor.partition_id

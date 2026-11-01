@@ -408,7 +408,11 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     const auto total_start =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
+    SpDiag::PerfPoint pt_pool(PerfKey::CLIENT_RPC_POOL_LOOKUP,
+                              SpDiag::PerfLevel::MODULE);
+    pt_pool.Start();
     auto pool = client_accessor_.GetClientPool();
+    pt_pool.End(0);
     const auto pool_end =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
@@ -424,12 +428,16 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto start_time = std::chrono::steady_clock::now();
     auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            SpDiag::PerfPoint pt_call(PerfKey::CLIENT_RPC_CALL,
+                                      SpDiag::PerfLevel::MODULE);
+            pt_call.Start();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
+            pt_call.End(ret.has_value() ? 0 : -1);
             if (breakdown_log) {
                 rpc_call_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -443,7 +451,11 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             const auto result_get_start =
                 breakdown_log ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
+            SpDiag::PerfPoint pt_get(PerfKey::CLIENT_RPC_RESULT_GET,
+                                     SpDiag::PerfLevel::MODULE);
+            pt_get.Start();
             auto result = co_await std::move(ret.value());
+            pt_get.End(0);
             if (breakdown_log) {
                 result_get_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -480,7 +492,11 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                 }
                 co_return tl::expected<void, ErrorCode>{};
             } else {
+                SpDiag::PerfPoint pt_parse(PerfKey::CLIENT_RPC_RESULT_PARSE,
+                                           SpDiag::PerfLevel::MODULE);
+                pt_parse.Start();
                 auto response = result->result();
+                pt_parse.End(0);
                 if (breakdown_log) {
                     result_parse_us =
                         std::chrono::duration_cast<std::chrono::microseconds>(
