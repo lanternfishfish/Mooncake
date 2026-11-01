@@ -317,7 +317,9 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         });
     // 路由内联（L1）：读响应在 RPC 边界挂 route；建不出来即整单失败
     //（不返回「有 descriptor 但没有 route」的响应，客户端也不回退旧 RPC）。
+    uint64_t route_build_us = 0;
     if (result) {
+        const auto t_route = std::chrono::steady_clock::now();
         // 读路径归因：内联 route 构建整体窗口（不含序列化/传输）。
         SpDiag::PerfPoint pt_route(PerfKey::MASTER_ROUTE_BUILD,
                                    SpDiag::PerfLevel::MODULE);
@@ -330,6 +332,10 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         }
         result->vsegment_routes = std::move(*routes);
         pt_route.End(0);
+        route_build_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_route)
+                .count();
         vsegment::LogRouteStats("GetReplicaList", result->vsegment_routes);
     }
     if (sample) {
@@ -342,6 +348,9 @@ WrappedMasterService::GetReplicaList(const std::string& key,
                      << " key=" << key << " tenant=" << tenant_id
                      << " replica_count="
                      << (result ? result->replicas.size() : 0)
+                     << " route_build_us=" << route_build_us
+                     << " route_count="
+                     << (result ? result->vsegment_routes.size() : 0)
                      << " latency_us=" << latency_us << " status="
                      << (result.has_value() ? "ok" : toString(result.error()));
     }
