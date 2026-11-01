@@ -402,17 +402,28 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
+    return invoke_rpc_staged<ServiceMethod, ReturnType>(
+        /*read_stages=*/false, std::forward<Args>(args)...);
+}
+
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_staged(
+    bool read_stages, Args&&... args) {
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     const bool breakdown_log =
         mooncake::logging::ShouldSampleHiFreqLog(trace_id);
     const auto total_start =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
-    SpDiag::PerfPoint pt_pool(PerfKey::CLIENT_RPC_POOL_LOOKUP,
-                              SpDiag::PerfLevel::MODULE);
-    pt_pool.Start();
+    // 读特有细分点：只有读 RPC 才启用，避免与写路径的 RPC 混在一起统计。
+    std::optional<SpDiag::PerfPoint> pt_pool;
+    if (read_stages) {
+        pt_pool.emplace(PerfKey::CLIENT_RPC_POOL_LOOKUP,
+                        SpDiag::PerfLevel::MODULE);
+        pt_pool->Start();
+    }
     auto pool = client_accessor_.GetClientPool();
-    pt_pool.End(0);
+    if (pt_pool) pt_pool->End(0);
     const auto pool_end =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
@@ -428,16 +439,12 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto start_time = std::chrono::steady_clock::now();
     auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
-            SpDiag::PerfPoint pt_call(PerfKey::CLIENT_RPC_CALL,
-                                      SpDiag::PerfLevel::MODULE);
-            pt_call.Start();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
-            pt_call.End(ret.has_value() ? 0 : -1);
             if (breakdown_log) {
                 rpc_call_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -451,11 +458,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             const auto result_get_start =
                 breakdown_log ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
-            SpDiag::PerfPoint pt_get(PerfKey::CLIENT_RPC_RESULT_GET,
-                                     SpDiag::PerfLevel::MODULE);
-            pt_get.Start();
             auto result = co_await std::move(ret.value());
-            pt_get.End(0);
             if (breakdown_log) {
                 result_get_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -492,11 +495,14 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                 }
                 co_return tl::expected<void, ErrorCode>{};
             } else {
-                SpDiag::PerfPoint pt_parse(PerfKey::CLIENT_RPC_RESULT_PARSE,
-                                           SpDiag::PerfLevel::MODULE);
-                pt_parse.Start();
+                std::optional<SpDiag::PerfPoint> pt_parse;
+                if (read_stages) {
+                    pt_parse.emplace(PerfKey::CLIENT_RPC_RESULT_PARSE,
+                                     SpDiag::PerfLevel::MODULE);
+                    pt_parse->Start();
+                }
                 auto response = result->result();
-                pt_parse.End(0);
+                if (pt_parse) pt_parse->End(0);
                 if (breakdown_log) {
                     result_parse_us =
                         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -645,7 +651,10 @@ tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
         pt_rpc.emplace(rpc_stat_key, SpDiag::PerfLevel::MODULE);
         pt_rpc->Start();
     }
-    auto result = invoke_rpc<ServiceMethod, ReturnType>(args...);
+    const bool read_stages =
+        rpc_stat_key == static_cast<uint32_t>(PerfKey::QUERY_RPC_CALL);
+    auto result = invoke_rpc_staged<ServiceMethod, ReturnType>(
+        read_stages, args...);
     if (pt_rpc) {
         pt_rpc->End(result ? 0 : -1);
     }

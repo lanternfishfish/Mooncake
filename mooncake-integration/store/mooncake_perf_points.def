@@ -290,8 +290,6 @@ PERF_KEY_DEF(GET_SSD_LEASE_EXPIRED,   "real_client.cpp::batch_get_into_offload_o
 PERF_KEY_DEF(GET_PROMOTION_ENQUEUE,   "master_service.cpp::TryPushPromotionQueue", "PromotionEnqueue")
 // === vsegment 观测（master RPC + client 翻译层） ===
 PERF_KEY_DEF(VSEGMENT_READ_PLAN,               "client_service.cpp::TransferData",     "VSegPlan")
-PERF_KEY_DEF(VSEGMENT_VIEW_LOAD,               "client_service.cpp::TransferData",     "VSegViewLoad")
-PERF_KEY_DEF(VSEGMENT_ENDPOINT_RESOLVE,        "client_service.cpp::TransferData",     "VSegEndpointResolve")
 // 读路径细分（L2 read 优化）：master 侧内联 route 构建 + 客户端规划内部两段
 PERF_KEY_DEF(MASTER_ROUTE_BUILD,               "rpc_service.cpp::BuildRoute",          "BuildVSegRoute")
 PERF_KEY_DEF(MASTER_ROUTE_LOADVIEW,            "master_service.cpp::BuildRoute",       "RouteLoadView")
@@ -300,8 +298,6 @@ PERF_KEY_DEF(VSEGMENT_PLAN_CHECK,              "client_service.cpp::TransferData
 PERF_KEY_DEF(VSEGMENT_PLAN_EXPAND,             "client_service.cpp::TransferData",     "VSegPlanExpand")
 // 读路径：把一次 RPC 往返拆成 4 段（按 RPC 聚合，读窗口内以 GetReplicaList 为主）
 PERF_KEY_DEF(CLIENT_RPC_POOL_LOOKUP,           "master_client.cpp::invoke_rpc",        "RpcPoolLookup")
-PERF_KEY_DEF(CLIENT_RPC_CALL,                  "master_client.cpp::invoke_rpc",        "RpcCall")
-PERF_KEY_DEF(CLIENT_RPC_RESULT_GET,            "master_client.cpp::invoke_rpc",        "RpcResultGet")
 PERF_KEY_DEF(CLIENT_RPC_RESULT_PARSE,          "master_client.cpp::invoke_rpc",        "RpcResultParse")
 // 读路径：master LoadView 内部两段 + 客户端 QueryResult 构造 + route 查表
 PERF_KEY_DEF(VSEG_LOADVIEW_FIND,               "vsegment_service.cpp::LoadView",       "ViewFindPartition")

@@ -957,6 +957,14 @@ class MasterClient {
         Args&&... args);
 
     /**
+     * @brief 与 invoke_rpc 相同，但可显式开启「读特有」的细分 SpDiag 点位
+     *（RpcPoolLookup / RpcResultParse）。仅读 RPC 传入 true，避免写路径混入。
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_staged(
+        bool read_stages, Args&&... args);
+
+    /**
      * @brief 定向 RPC：向指定 submaster 发请求，使用独立的 targeted_accessor_
      * 缓存 per-address pool，不切换 client_accessor_ 的"当前地址"。供后台心跳
      * /全量 mount/unmount 使用，避免与业务请求（SwitchToSubmaster + invoke_rpc）
