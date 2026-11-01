@@ -84,9 +84,19 @@ void LogRouteStats(const char* entry,
                    const std::vector<VSegmentRoute>& routes) {
     if (!mooncake::logging::ShouldSampleHiFreqLog()) return;
     size_t members = 0;
-    for (const auto& route : routes) members += route.locations.size();
+    size_t est_bytes = 0;
+    for (const auto& route : routes) {
+        members += route.locations.size();
+        // 估算序列化体积：view 的字符串 + 每成员 segment_id/endpoint + 定长字段。
+        est_bytes += route.view.partition_id.size() +
+                     route.view.vsegment_id.size() + 64;
+        for (const auto& location : route.locations)
+            est_bytes += location.segment_id.size() + location.endpoint.size() +
+                         16;
+    }
     MC_LOG(INFO) << "vsegment_route_inline entry=" << entry
-                 << " routes=" << routes.size() << " members=" << members;
+                 << " routes=" << routes.size() << " members=" << members
+                 << " est_bytes=" << est_bytes;
 }
 
 }  // namespace mooncake::vsegment

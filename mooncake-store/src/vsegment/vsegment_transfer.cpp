@@ -1,5 +1,10 @@
 #include "vsegment/vsegment_transfer.h"
 
+// 读路径细分点位（与 client_service.cpp 同一个 SpDiag program）。
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
+
 #include <limits>
 
 namespace mooncake::vsegment {
@@ -14,6 +19,10 @@ VSegmentTransferPlan VSegmentTransferPlanner::PlanWithRoute(
         plan.detail = "invalid vsegment transfer planner input";
         return plan;
     }
+    // 校验段单独计时（身份 / checksum / 成员顺序）。
+    SpDiag::PerfPoint pt_check(PerfKey::VSEGMENT_PLAN_CHECK,
+                               SpDiag::PerfLevel::MODULE);
+    pt_check.Start();
     // 1) 身份必须与 descriptor 一致。
     if (route.view.partition_id != replica.partition_id ||
         route.view.vsegment_id != replica.vsegment_id) {
@@ -45,6 +54,11 @@ VSegmentTransferPlan VSegmentTransferPlanner::PlanWithRoute(
             return plan;
         }
     }
+    pt_check.End(0);
+    // 展开段单独计时（逻辑区间 → 物理子请求 + 成员查表）。
+    SpDiag::PerfPoint pt_expand(PerfKey::VSEGMENT_PLAN_EXPAND,
+                                SpDiag::PerfLevel::MODULE);
+    pt_expand.Start();
     // 4) 逻辑区间 → 物理子请求（纯计算，不发 RPC）。
     auto resolved = ResolveTransfer(route.view, replica.logical_offset,
                                     replica.length, slices);
@@ -80,6 +94,7 @@ VSegmentTransferPlan VSegmentTransferPlanner::PlanWithRoute(
         request.physical_offset += location->base_address;
         plan.requests.push_back({std::move(request), location->endpoint});
     }
+    pt_expand.End(0);
     return plan;
 }
 

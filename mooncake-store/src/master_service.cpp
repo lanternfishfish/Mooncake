@@ -7309,16 +7309,34 @@ MasterService::BuildVSegmentRoutesForResponse(
     auto load_view = [this](const std::string& partition_id,
                             const std::string& vsegment_id,
                             vsegment::VSegmentView* view) -> ErrorCode {
-        if (!vsegment_service_) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-        return vsegment_service_->LoadView(partition_id, vsegment_id, view);
+        // 读路径细分：两次加锁（service + manager）+ VSegmentView 整体拷贝。
+        SpDiag::PerfPoint pt(PerfKey::MASTER_ROUTE_LOADVIEW,
+                             SpDiag::PerfLevel::MODULE);
+        pt.Start();
+        if (!vsegment_service_) {
+            pt.End(-1);
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+        const auto error =
+            vsegment_service_->LoadView(partition_id, vsegment_id, view);
+        pt.End(error == ErrorCode::OK ? 0 : -1);
+        return error;
     };
     auto resolve_endpoint = [this](const std::string& segment_id,
                                    std::string* endpoint,
                                    uint64_t* base_address) -> bool {
+        // 读路径细分：每成员一次（StringToUuid + segment 查表 + 字段拷贝）。
+        SpDiag::PerfPoint pt(PerfKey::MASTER_ROUTE_MEMBERS,
+                             SpDiag::PerfLevel::MODULE);
+        pt.Start();
         vsegment::PSegmentLocation location;
-        if (!ResolvePSegmentLocation(segment_id, &location)) return false;
+        if (!ResolvePSegmentLocation(segment_id, &location)) {
+            pt.End(-1);
+            return false;
+        }
         *endpoint = std::move(location.endpoint);
         *base_address = location.base_address;
+        pt.End(0);
         return true;
     };
     return vsegment::BuildVSegmentRoutes(replicas, load_view, resolve_endpoint);

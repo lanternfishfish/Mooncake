@@ -318,10 +318,18 @@ WrappedMasterService::GetReplicaList(const std::string& key,
     // 路由内联（L1）：读响应在 RPC 边界挂 route；建不出来即整单失败
     //（不返回「有 descriptor 但没有 route」的响应，客户端也不回退旧 RPC）。
     if (result) {
+        // 读路径归因：内联 route 构建整体窗口（不含序列化/传输）。
+        SpDiag::PerfPoint pt_route(PerfKey::MASTER_ROUTE_BUILD,
+                                   SpDiag::PerfLevel::MODULE);
+        pt_route.Start();
         auto routes = master_service_.BuildVSegmentRoutesForResponse(
             result->replicas);
-        if (!routes) return tl::make_unexpected(routes.error());
+        if (!routes) {
+            pt_route.End(-1);
+            return tl::make_unexpected(routes.error());
+        }
         result->vsegment_routes = std::move(*routes);
+        pt_route.End(0);
         vsegment::LogRouteStats("GetReplicaList", result->vsegment_routes);
     }
     if (sample) {

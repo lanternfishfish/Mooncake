@@ -292,6 +292,12 @@ PERF_KEY_DEF(GET_PROMOTION_ENQUEUE,   "master_service.cpp::TryPushPromotionQueue
 PERF_KEY_DEF(VSEGMENT_READ_PLAN,               "client_service.cpp::TransferData",     "VSegPlan")
 PERF_KEY_DEF(VSEGMENT_VIEW_LOAD,               "client_service.cpp::TransferData",     "VSegViewLoad")
 PERF_KEY_DEF(VSEGMENT_ENDPOINT_RESOLVE,        "client_service.cpp::TransferData",     "VSegEndpointResolve")
+// 读路径细分（L2 read 优化）：master 侧内联 route 构建 + 客户端规划内部两段
+PERF_KEY_DEF(MASTER_ROUTE_BUILD,               "rpc_service.cpp::BuildRoute",          "BuildVSegRoute")
+PERF_KEY_DEF(MASTER_ROUTE_LOADVIEW,            "master_service.cpp::BuildRoute",       "RouteLoadView")
+PERF_KEY_DEF(MASTER_ROUTE_MEMBERS,             "master_service.cpp::BuildRoute",       "RouteMembers")
+PERF_KEY_DEF(VSEGMENT_PLAN_CHECK,              "client_service.cpp::TransferData",     "VSegPlanCheck")
+PERF_KEY_DEF(VSEGMENT_PLAN_EXPAND,             "client_service.cpp::TransferData",     "VSegPlanExpand")
 // === Query 路径下钻（GET 路径核心通信段统计） ===
 PERF_KEY_DEF(QUERY_ROUTE_SWITCH,  "master_client.cpp::Query",  "QueryRouteSwitch")
 PERF_KEY_DEF(QUERY_RPC_CALL,      "master_client.cpp::Query",  "QueryRpcCall")
